@@ -53,3 +53,10 @@ alembic/versions/*.pyc
 Thumbs.db
 
 app/data/aws_provider_schema.json
+
+# Terraform provider cache (large binaries)
+app/data/terraform_plugin_cache/
+app/data/terraform_warm_workspace/
+
+# Claude Code memory
+.claude/

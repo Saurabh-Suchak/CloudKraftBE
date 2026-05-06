@@ -42,11 +42,16 @@ class ValidationError(BaseModel):
 
 
 class ValidationRequest(BaseModel):
-    terraform_code: str
+    terraform_code: str = ""
+    # Optional: pass the full set of generated files for real terraform validate
+    files: List[TerraformFile] = []
 
 
 class ValidationResponse(BaseModel):
     valid: bool
     errors: List[ValidationError] = []
     warnings: List[ValidationError] = []
+    # Which validator was used and its version
+    method: str = "static"               # "terraform" | "static"
+    validator_version: Optional[str] = None
 
