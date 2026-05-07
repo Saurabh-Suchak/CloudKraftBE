@@ -58,5 +58,8 @@ app/data/aws_provider_schema.json
 app/data/terraform_plugin_cache/
 app/data/terraform_warm_workspace/
 
+# Runtime workspace data
+app/data/workspaces/
+
 # Claude Code memory
 .claude/
