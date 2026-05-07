@@ -164,6 +164,10 @@ async def destroy_deployment(
             detail=f"Cannot destroy deployment with status '{deployment.status}'"
         )
 
+    deployment.status = "destroying"
+    db.commit()
+    db.refresh(deployment)
+
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, run_destroy, deployment.id, current_user.id)
 
