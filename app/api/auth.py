@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta
+import uuid
 from app.database import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserResponse, Token, UserAWSRegister, ConnectAWSRequest, AWSStatusResponse
@@ -63,7 +64,8 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     db_user = User(
         email=user_data.email,
         password_hash=hashed_password,
-        full_name=user_data.full_name
+        full_name=user_data.full_name,
+        external_id=encrypt_aws_credentials(str(uuid.uuid4())),
     )
     db.add(db_user)
     db.commit()
@@ -117,7 +119,8 @@ def register_with_aws(user_data: UserAWSRegister, db: Session = Depends(get_db))
         full_name=user_data.full_name,
         aws_access_key=encrypted_access_key,
         aws_secret_key=encrypted_secret_key,
-        aws_region=user_data.aws_region
+        aws_region=user_data.aws_region,
+        external_id=encrypt_aws_credentials(str(uuid.uuid4())),
     )
     db.add(db_user)
     db.commit()
@@ -208,8 +211,14 @@ def connect_aws(
 
 
 @router.get("/aws-status", response_model=AWSStatusResponse)
-def aws_status(current_user: User = Depends(get_current_user)):
+def aws_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return whether the user has AWS credentials connected."""
+    # Backfill external_id for existing users that predate this field
+    if not current_user.external_id:
+        current_user.external_id = encrypt_aws_credentials(str(uuid.uuid4()))
+        db.commit()
+        db.refresh(current_user)
+
     connected = bool(
         (current_user.auth_method == "access_key" and current_user.aws_access_key)
         or (current_user.auth_method == "assume_role" and current_user.role_arn)
@@ -219,5 +228,6 @@ def aws_status(current_user: User = Depends(get_current_user)):
         auth_method=current_user.auth_method,
         region=current_user.aws_region,
         role_arn=current_user.role_arn,
+        external_id=decrypt_aws_credentials(current_user.external_id),
     )
 
