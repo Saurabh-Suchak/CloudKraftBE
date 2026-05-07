@@ -166,7 +166,7 @@ def connect_aws(
         current_user.aws_secret_key = encrypt_aws_credentials(request.secret_key)
         current_user.aws_region = request.region
         current_user.role_arn = None
-        current_user.external_id = None
+        # Keep external_id — permanent per-user UUID, must not be wiped
 
     elif request.auth_method == "assume_role":
         if not request.role_arn:
@@ -193,20 +193,23 @@ def connect_aws(
 
         current_user.auth_method = "assume_role"
         current_user.role_arn = request.role_arn
-        current_user.external_id = (
-            encrypt_aws_credentials(request.external_id) if request.external_id else None
-        )
+        # Only overwrite external_id if one was sent; never wipe permanent UUID
+        if request.external_id:
+            current_user.external_id = encrypt_aws_credentials(request.external_id)
         current_user.aws_region = request.region
         current_user.aws_access_key = None
         current_user.aws_secret_key = None
 
     db.commit()
+    db.refresh(current_user)
 
+    ext_id_plain = decrypt_aws_credentials(current_user.external_id) if current_user.external_id else None
     return AWSStatusResponse(
         connected=True,
         auth_method=current_user.auth_method,
         region=current_user.aws_region,
         role_arn=current_user.role_arn,
+        external_id=ext_id_plain,
     )
 
 
