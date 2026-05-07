@@ -36,6 +36,7 @@ class AWSStatusResponse(BaseModel):
     auth_method: Optional[str] = None
     region: Optional[str] = None
     role_arn: Optional[str] = None
+    external_id: Optional[str] = None
 
 
 class UserLogin(BaseModel):
