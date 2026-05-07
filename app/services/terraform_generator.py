@@ -232,7 +232,7 @@ CONFIG_TRANSFORMS: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
     "aws_instance": {
-        "ami":           '"ami-0abcdef1234567890"',
+        "ami":           "data.aws_ami.amazon_linux_2.id",
         "instance_type": '"t2.micro"',
     },
     "aws_vpc": {
@@ -339,6 +339,12 @@ BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
 # Attributes to always skip (computed system fields)
 _SKIP_ATTRS = frozenset({"id", "tags_all", "arn"})
 
+# Node types that require a subnet (and thus trigger scaffold injection)
+_SUBNET_DEPENDENT_TYPES = frozenset({"ec2", "rds", "loadbalancer", "efs", "ebs"})
+
+# Synthetic node IDs injected when no VPC/subnet exists in the workflow
+_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__"})
+
 
 class TerraformGenerator:
     """Generate Terraform HCL code from a workflow state using the AWS provider schema."""
@@ -363,6 +369,7 @@ class TerraformGenerator:
             terraform.tfvars – concrete variable values
         """
         self.nodes = {n.id: n for n in workflow_state.nodes}
+        self._inject_scaffold_nodes()
         dependency_order = self._get_dependency_order()
 
         return {
@@ -427,7 +434,57 @@ class TerraformGenerator:
 
     def _generate_main_tf(self, dependency_order: List[str]) -> str:
         blocks: List[str] = []
+
+        # Prepend data source for latest Amazon Linux 2 AMI when any EC2 instance
+        # is present and has no explicit AMI ID configured by the user.
+        needs_ami_data = any(
+            self.nodes[nid].type == "ec2"
+            and not self._get_config_value("ami", self.nodes[nid].config)
+            for nid in dependency_order
+            if nid in self.nodes
+        )
+        if needs_ami_data:
+            blocks.append(
+                'data "aws_ami" "amazon_linux_2" {\n'
+                "  most_recent = true\n"
+                '  owners      = ["amazon"]\n'
+                "\n"
+                "  filter {\n"
+                '    name   = "name"\n'
+                '    values = ["amzn2-ami-hvm-*-x86_64-gp2"]\n'
+                "  }\n"
+                "}\n"
+            )
+
+        # Scaffold VPC block (auto-generated when no VPC exists in workflow)
+        if "__scaffold_vpc__" in self.nodes:
+            blocks.append(
+                'resource "aws_vpc" "cloudkraft_vpc" {\n'
+                '  cidr_block           = "10.0.0.0/16"\n'
+                '  enable_dns_hostnames = true\n'
+                '  enable_dns_support   = true\n'
+                '  tags = { Name = "cloudkraft-vpc" }\n'
+                '}\n'
+            )
+
+        # Scaffold Subnet block (auto-generated when no subnet exists in workflow)
+        if "__scaffold_subnet__" in self.nodes:
+            vpc_ref = (
+                self._find_resource_reference("vpc", self.nodes["__scaffold_subnet__"], "id")
+                or "aws_vpc.cloudkraft_vpc.id"
+            )
+            blocks.append(
+                'resource "aws_subnet" "cloudkraft_subnet" {\n'
+                f'  vpc_id                  = {vpc_ref}\n'
+                '  cidr_block              = "10.0.1.0/24"\n'
+                '  map_public_ip_on_launch = true\n'
+                '  tags = { Name = "cloudkraft-subnet" }\n'
+                '}\n'
+            )
+
         for node_id in dependency_order:
+            if node_id in _SCAFFOLD_IDS:
+                continue  # already emitted above
             node = self.nodes[node_id]
             block = self._generate_resource_block(node)
             if block:
@@ -472,6 +529,41 @@ class TerraformGenerator:
                 break
 
         return f'aws_region = "{region}"\n'
+
+    # ------------------------------------------------------------------
+    # Scaffold injection
+    # ------------------------------------------------------------------
+
+    def _inject_scaffold_nodes(self) -> None:
+        """
+        When compute resources need a subnet but none exists in the workflow,
+        inject synthetic VPC + Subnet nodes so reference resolution produces
+        valid HCL instead of missing ``subnet_id``.
+        """
+        has_subnet = any(n.type == "subnet" for n in self.nodes.values())
+        needs_subnet = any(n.type in _SUBNET_DEPENDENT_TYPES for n in self.nodes.values())
+
+        if not needs_subnet or has_subnet:
+            return
+
+        has_vpc = any(n.type == "vpc" for n in self.nodes.values())
+
+        if not has_vpc:
+            self.nodes["__scaffold_vpc__"] = WorkflowNode(
+                id="__scaffold_vpc__",
+                type="vpc",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "cloudkraft_vpc"},
+                connections=[],
+            )
+
+        self.nodes["__scaffold_subnet__"] = WorkflowNode(
+            id="__scaffold_subnet__",
+            type="subnet",
+            position={"x": 0, "y": 0},
+            config={"nodeName": "cloudkraft_subnet"},
+            connections=[],
+        )
 
     # ------------------------------------------------------------------
     # Dependency ordering (topological sort)
