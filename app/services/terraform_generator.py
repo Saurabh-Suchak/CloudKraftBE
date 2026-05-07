@@ -323,16 +323,8 @@ BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
         "viewer_certificate": [
             "cloudfront_default_certificate = true",
         ],
-        "default_cache_behavior": [
-            'viewer_protocol_policy = "redirect-to-https"',
-            'allowed_methods        = ["GET", "HEAD"]',
-            'cached_methods         = ["GET", "HEAD"]',
-            'target_origin_id       = "primary"',
-            "forwarded_values {",
-            "  query_string = false",
-            "  cookies { forward = \"none\" }",
-            "}",
-        ],
+        # default_cache_behavior emitted dynamically in _generate_nested_blocks
+        # so target_origin_id matches the origin block's origin_id
     },
 }
 
@@ -349,9 +341,10 @@ _SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__"})
 class TerraformGenerator:
     """Generate Terraform HCL code from a workflow state using the AWS provider schema."""
 
-    def __init__(self) -> None:
+    def __init__(self, suffix: str = "") -> None:
         self.nodes: Dict[str, WorkflowNode] = {}
         self._schema = get_aws_schema()
+        self._suffix = suffix  # appended to nodeName values to ensure unique AWS resource names
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -613,7 +606,9 @@ class TerraformGenerator:
             return None
 
         resource_name = self._get_resource_name(node)
-        config = node.config or {}
+        config = dict(node.config or {})
+        if self._suffix and config.get("nodeName"):
+            config["nodeName"] = str(config["nodeName"]) + self._suffix
 
         lines = [f'resource "{terraform_type}" "{resource_name}" {{']
 
@@ -740,15 +735,31 @@ class TerraformGenerator:
             ]
 
         if terraform_type == "aws_cloudfront_distribution":
-            origin_domain = (
-                config.get("nodeOrigin")
-                or config.get("origin")
-                or "example.com"
-            )
+            # Prefer connected S3 bucket's regional domain, fallback to config/placeholder
+            s3_domain_ref = self._find_resource_reference("s3", node, "bucket_regional_domain_name")
+            if s3_domain_ref:
+                origin_domain_hcl = s3_domain_ref  # Terraform reference, no quotes
+            else:
+                raw_domain = (
+                    config.get("nodeOrigin")
+                    or config.get("origin")
+                    or "example.com"
+                )
+                origin_domain_hcl = f'"{raw_domain}"'
             origin_id = config.get("nodeName") or f"cf-{node.id}"
             lines += [
+                "default_cache_behavior {",
+                '  viewer_protocol_policy = "redirect-to-https"',
+                '  allowed_methods        = ["GET", "HEAD"]',
+                '  cached_methods         = ["GET", "HEAD"]',
+                f'  target_origin_id       = "{origin_id}"',
+                "  forwarded_values {",
+                "    query_string = false",
+                '    cookies { forward = "none" }',
+                "  }",
+                "}",
                 "origin {",
-                f'  domain_name = "{origin_domain}"',
+                f'  domain_name = {origin_domain_hcl}',
                 f'  origin_id   = "{origin_id}"',
                 "}",
             ]
@@ -929,6 +940,6 @@ def generate_terraform(workflow_state: WorkflowState) -> str:
     return TerraformGenerator().generate(workflow_state)
 
 
-def generate_terraform_files(workflow_state: WorkflowState) -> Dict[str, str]:
+def generate_terraform_files(workflow_state: WorkflowState, suffix: str = "") -> Dict[str, str]:
     """Return a dict of filename → content for all Terraform project files."""
-    return TerraformGenerator().generate_files(workflow_state)
+    return TerraformGenerator(suffix=suffix).generate_files(workflow_state)
