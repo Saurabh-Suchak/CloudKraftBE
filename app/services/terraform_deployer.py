@@ -114,6 +114,21 @@ def _prepare_workspace(workspace: Path, tf_files: Dict[str, str], db, deployment
         (workspace / filename).write_text(content, encoding="utf-8")
         _add_log(db, deployment_id, f"  wrote {filename}")
 
+    # Create placeholder zip if any Lambda function references lambda_function.zip
+    needs_zip = any(
+        "lambda_function.zip" in content
+        for content in tf_files.values()
+    )
+    if needs_zip:
+        zip_path = workspace / "lambda_function.zip"
+        if not zip_path.exists():
+            import zipfile, io
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("index.py", 'def handler(event, context):\n    return {"statusCode": 200, "body": "ok"}\n')
+            zip_path.write_bytes(buf.getvalue())
+            _add_log(db, deployment_id, "  wrote lambda_function.zip (placeholder)")
+
     dot_terraform = workspace / ".terraform"
     if _warm_workspace_ready() and not dot_terraform.exists():
         try:
@@ -154,7 +169,7 @@ def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) 
         _add_log(db, deployment_id, "Generating Terraform configuration...")
         try:
             workflow_state = WorkflowState(**workflow_state_dict)
-            tf_files = generate_terraform_files(workflow_state)
+            tf_files = generate_terraform_files(workflow_state, suffix=f"-ck{deployment_id}")
         except Exception as e:
             _add_log(db, deployment_id, f"HCL generation failed: {e}", "error")
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
