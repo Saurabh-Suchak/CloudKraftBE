@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     
     # AWS Credentials Encryption
     ENCRYPTION_KEY: str = "your-encryption-key-change-in-production"
+
+    # Optional: backend's own AWS credentials for assume_role validation + deployment
+    BACKEND_AWS_ACCESS_KEY: str = ""
+    BACKEND_AWS_SECRET_KEY: str = ""
+    BACKEND_AWS_REGION: str = "us-east-1"
     
     @field_validator('CORS_ORIGINS', mode='before')
     @classmethod

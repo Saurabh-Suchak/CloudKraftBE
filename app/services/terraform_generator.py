@@ -232,7 +232,7 @@ CONFIG_TRANSFORMS: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
     "aws_instance": {
-        "ami":           '"ami-0abcdef1234567890"',
+        "ami":           "data.aws_ami.amazon_linux_2.id",
         "instance_type": '"t2.micro"',
     },
     "aws_vpc": {
@@ -323,29 +323,28 @@ BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
         "viewer_certificate": [
             "cloudfront_default_certificate = true",
         ],
-        "default_cache_behavior": [
-            'viewer_protocol_policy = "redirect-to-https"',
-            'allowed_methods        = ["GET", "HEAD"]',
-            'cached_methods         = ["GET", "HEAD"]',
-            'target_origin_id       = "primary"',
-            "forwarded_values {",
-            "  query_string = false",
-            "  cookies { forward = \"none\" }",
-            "}",
-        ],
+        # default_cache_behavior emitted dynamically in _generate_nested_blocks
+        # so target_origin_id matches the origin block's origin_id
     },
 }
 
 # Attributes to always skip (computed system fields)
 _SKIP_ATTRS = frozenset({"id", "tags_all", "arn"})
 
+# Node types that require a subnet (and thus trigger scaffold injection)
+_SUBNET_DEPENDENT_TYPES = frozenset({"ec2", "rds", "loadbalancer", "efs", "ebs"})
+
+# Synthetic node IDs injected when no VPC/subnet exists in the workflow
+_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__"})
+
 
 class TerraformGenerator:
     """Generate Terraform HCL code from a workflow state using the AWS provider schema."""
 
-    def __init__(self) -> None:
+    def __init__(self, suffix: str = "") -> None:
         self.nodes: Dict[str, WorkflowNode] = {}
         self._schema = get_aws_schema()
+        self._suffix = suffix  # appended to nodeName values to ensure unique AWS resource names
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -363,6 +362,7 @@ class TerraformGenerator:
             terraform.tfvars – concrete variable values
         """
         self.nodes = {n.id: n for n in workflow_state.nodes}
+        self._inject_scaffold_nodes()
         dependency_order = self._get_dependency_order()
 
         return {
@@ -427,7 +427,57 @@ class TerraformGenerator:
 
     def _generate_main_tf(self, dependency_order: List[str]) -> str:
         blocks: List[str] = []
+
+        # Prepend data source for latest Amazon Linux 2 AMI when any EC2 instance
+        # is present and has no explicit AMI ID configured by the user.
+        needs_ami_data = any(
+            self.nodes[nid].type == "ec2"
+            and not self._get_config_value("ami", self.nodes[nid].config)
+            for nid in dependency_order
+            if nid in self.nodes
+        )
+        if needs_ami_data:
+            blocks.append(
+                'data "aws_ami" "amazon_linux_2" {\n'
+                "  most_recent = true\n"
+                '  owners      = ["amazon"]\n'
+                "\n"
+                "  filter {\n"
+                '    name   = "name"\n'
+                '    values = ["amzn2-ami-hvm-*-x86_64-gp2"]\n'
+                "  }\n"
+                "}\n"
+            )
+
+        # Scaffold VPC block (auto-generated when no VPC exists in workflow)
+        if "__scaffold_vpc__" in self.nodes:
+            blocks.append(
+                'resource "aws_vpc" "cloudkraft_vpc" {\n'
+                '  cidr_block           = "10.0.0.0/16"\n'
+                '  enable_dns_hostnames = true\n'
+                '  enable_dns_support   = true\n'
+                '  tags = { Name = "cloudkraft-vpc" }\n'
+                '}\n'
+            )
+
+        # Scaffold Subnet block (auto-generated when no subnet exists in workflow)
+        if "__scaffold_subnet__" in self.nodes:
+            vpc_ref = (
+                self._find_resource_reference("vpc", self.nodes["__scaffold_subnet__"], "id")
+                or "aws_vpc.cloudkraft_vpc.id"
+            )
+            blocks.append(
+                'resource "aws_subnet" "cloudkraft_subnet" {\n'
+                f'  vpc_id                  = {vpc_ref}\n'
+                '  cidr_block              = "10.0.1.0/24"\n'
+                '  map_public_ip_on_launch = true\n'
+                '  tags = { Name = "cloudkraft-subnet" }\n'
+                '}\n'
+            )
+
         for node_id in dependency_order:
+            if node_id in _SCAFFOLD_IDS:
+                continue  # already emitted above
             node = self.nodes[node_id]
             block = self._generate_resource_block(node)
             if block:
@@ -472,6 +522,41 @@ class TerraformGenerator:
                 break
 
         return f'aws_region = "{region}"\n'
+
+    # ------------------------------------------------------------------
+    # Scaffold injection
+    # ------------------------------------------------------------------
+
+    def _inject_scaffold_nodes(self) -> None:
+        """
+        When compute resources need a subnet but none exists in the workflow,
+        inject synthetic VPC + Subnet nodes so reference resolution produces
+        valid HCL instead of missing ``subnet_id``.
+        """
+        has_subnet = any(n.type == "subnet" for n in self.nodes.values())
+        needs_subnet = any(n.type in _SUBNET_DEPENDENT_TYPES for n in self.nodes.values())
+
+        if not needs_subnet or has_subnet:
+            return
+
+        has_vpc = any(n.type == "vpc" for n in self.nodes.values())
+
+        if not has_vpc:
+            self.nodes["__scaffold_vpc__"] = WorkflowNode(
+                id="__scaffold_vpc__",
+                type="vpc",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "cloudkraft_vpc"},
+                connections=[],
+            )
+
+        self.nodes["__scaffold_subnet__"] = WorkflowNode(
+            id="__scaffold_subnet__",
+            type="subnet",
+            position={"x": 0, "y": 0},
+            config={"nodeName": "cloudkraft_subnet"},
+            connections=[],
+        )
 
     # ------------------------------------------------------------------
     # Dependency ordering (topological sort)
@@ -521,7 +606,9 @@ class TerraformGenerator:
             return None
 
         resource_name = self._get_resource_name(node)
-        config = node.config or {}
+        config = dict(node.config or {})
+        if self._suffix and config.get("nodeName"):
+            config["nodeName"] = str(config["nodeName"]) + self._suffix
 
         lines = [f'resource "{terraform_type}" "{resource_name}" {{']
 
@@ -648,15 +735,31 @@ class TerraformGenerator:
             ]
 
         if terraform_type == "aws_cloudfront_distribution":
-            origin_domain = (
-                config.get("nodeOrigin")
-                or config.get("origin")
-                or "example.com"
-            )
+            # Prefer connected S3 bucket's regional domain, fallback to config/placeholder
+            s3_domain_ref = self._find_resource_reference("s3", node, "bucket_regional_domain_name")
+            if s3_domain_ref:
+                origin_domain_hcl = s3_domain_ref  # Terraform reference, no quotes
+            else:
+                raw_domain = (
+                    config.get("nodeOrigin")
+                    or config.get("origin")
+                    or "example.com"
+                )
+                origin_domain_hcl = f'"{raw_domain}"'
             origin_id = config.get("nodeName") or f"cf-{node.id}"
             lines += [
+                "default_cache_behavior {",
+                '  viewer_protocol_policy = "redirect-to-https"',
+                '  allowed_methods        = ["GET", "HEAD"]',
+                '  cached_methods         = ["GET", "HEAD"]',
+                f'  target_origin_id       = "{origin_id}"',
+                "  forwarded_values {",
+                "    query_string = false",
+                '    cookies { forward = "none" }',
+                "  }",
+                "}",
                 "origin {",
-                f'  domain_name = "{origin_domain}"',
+                f'  domain_name = {origin_domain_hcl}',
                 f'  origin_id   = "{origin_id}"',
                 "}",
             ]
@@ -837,6 +940,6 @@ def generate_terraform(workflow_state: WorkflowState) -> str:
     return TerraformGenerator().generate(workflow_state)
 
 
-def generate_terraform_files(workflow_state: WorkflowState) -> Dict[str, str]:
+def generate_terraform_files(workflow_state: WorkflowState, suffix: str = "") -> Dict[str, str]:
     """Return a dict of filename → content for all Terraform project files."""
-    return TerraformGenerator().generate_files(workflow_state)
+    return TerraformGenerator(suffix=suffix).generate_files(workflow_state)
