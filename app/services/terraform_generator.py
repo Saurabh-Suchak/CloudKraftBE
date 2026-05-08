@@ -119,11 +119,13 @@ RESOURCE_MAPPING: Dict[str, str] = {
     "internetgateway":"aws_internet_gateway",
     "routetable":     "aws_route_table",
     "natgateway":     "aws_nat_gateway",
+    "eip":            "aws_eip",
     "loadbalancer":   "aws_lb",
     "s3":             "aws_s3_bucket",
     "efs":            "aws_efs_file_system",
     "ebs":            "aws_ebs_volume",
     "rds":            "aws_db_instance",
+    "dbsubnetgroup":  "aws_db_subnet_group",
     "dynamodb":       "aws_dynamodb_table",
     "sns":            "aws_sns_topic",
     "sqs":            "aws_sqs_queue",
@@ -139,10 +141,10 @@ RESOURCE_DEPENDENCIES: Dict[str, List[str]] = {
     "securitygroup":  ["vpc"],
     "internetgateway":["vpc"],
     "routetable":     ["vpc"],
-    "natgateway":     ["subnet"],
+    "natgateway":     ["subnet", "eip"],
     "ec2":            ["subnet", "securitygroup"],
     "loadbalancer":   ["subnet", "securitygroup"],
-    "rds":            ["subnet", "securitygroup"],
+    "rds":            ["subnet", "securitygroup", "dbsubnetgroup"],
     "efs":            ["subnet", "securitygroup"],
     "ebs":            ["subnet"],
 }
@@ -166,7 +168,7 @@ REFERENCE_ATTRIBUTE_MAP: Dict[str, Tuple[str, str, bool]] = {
     "subnet_ids":                ("subnet",          "id",   True),
     "subnets":                   ("subnet",          "id",   True),
     "vpc_zone_identifier":       ("subnet",          "id",   True),
-    "db_subnet_group_name":      ("subnet",          "id",   False),
+    "db_subnet_group_name":      ("dbsubnetgroup",   "name", False),
     "security_group_ids":        ("securitygroup",   "id",   True),
     "vpc_security_group_ids":    ("securitygroup",   "id",   True),
     "role":                      ("iamrole",         "arn",  False),
@@ -299,21 +301,8 @@ RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
 # Keys: terraform_type → block_name → list of inner HCL lines.
 # ---------------------------------------------------------------------------
 BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
-    "aws_security_group": {
-        "ingress": [
-            'description = "Allow SSH from trusted IPs only"',
-            "from_port   = 22",
-            "to_port     = 22",
-            'protocol    = "tcp"',
-            'cidr_blocks = ["YOUR_IP/32"]  # restrict to known CIDRs',
-        ],
-        "egress": [
-            "from_port   = 0",
-            "to_port     = 0",
-            'protocol    = "-1"',
-            'cidr_blocks = ["0.0.0.0/0"]',
-        ],
-    },
+    # aws_security_group ingress/egress handled dynamically in _generate_nested_blocks
+    # so CIDR can be taken from user config or defaulted to 0.0.0.0/0
     "aws_cloudfront_distribution": {
         "restrictions": [
             "geo_restriction {",
@@ -335,7 +324,13 @@ _SKIP_ATTRS = frozenset({"id", "tags_all", "arn"})
 _SUBNET_DEPENDENT_TYPES = frozenset({"ec2", "rds", "loadbalancer", "efs", "ebs"})
 
 # Synthetic node IDs injected when no VPC/subnet exists in the workflow
-_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__"})
+_SCAFFOLD_IDS = frozenset({
+    "__scaffold_vpc__",
+    "__scaffold_subnet__",
+    "__scaffold_subnet_2__",
+    "__scaffold_eip__",
+    "__scaffold_db_subnet_group__",
+})
 
 
 class TerraformGenerator:
@@ -470,8 +465,53 @@ class TerraformGenerator:
                 'resource "aws_subnet" "cloudkraft_subnet" {\n'
                 f'  vpc_id                  = {vpc_ref}\n'
                 '  cidr_block              = "10.0.1.0/24"\n'
+                '  availability_zone       = "us-east-1a"\n'
                 '  map_public_ip_on_launch = true\n'
                 '  tags = { Name = "cloudkraft-subnet" }\n'
+                '}\n'
+            )
+
+        # Scaffold EIP block (auto-generated when NAT Gateway exists but no EIP on canvas)
+        if "__scaffold_eip__" in self.nodes:
+            blocks.append(
+                'resource "aws_eip" "nat_eip" {\n'
+                '  domain = "vpc"\n'
+                '  tags   = { Name = "nat-eip" }\n'
+                '}\n'
+            )
+
+        # Scaffold second subnet (auto-generated when ALB exists with only 1 subnet)
+        if "__scaffold_subnet_2__" in self.nodes:
+            vpc_ref = (
+                self._find_resource_reference("vpc", self.nodes["__scaffold_subnet_2__"], "id")
+                or "aws_vpc.cloudkraft_vpc.id"
+            )
+            blocks.append(
+                'resource "aws_subnet" "cloudkraft_subnet_2" {\n'
+                f'  vpc_id                  = {vpc_ref}\n'
+                '  cidr_block              = "10.0.2.0/24"\n'
+                '  availability_zone       = "us-east-1b"\n'
+                '  map_public_ip_on_launch = true\n'
+                '  tags = { Name = "cloudkraft-subnet-2" }\n'
+                '}\n'
+            )
+
+        # Scaffold DB Subnet Group (auto-generated when RDS exists without one on canvas)
+        if "__scaffold_db_subnet_group__" in self.nodes:
+            # Collect all subnet references in the workflow
+            subnet_refs = [
+                self._ref_expr(n, "id")
+                for n in self.nodes.values()
+                if n.type == "subnet"
+            ]
+            if not subnet_refs:
+                subnet_refs = ["aws_subnet.cloudkraft_subnet.id"]
+            subnet_ids_hcl = ", ".join(subnet_refs)
+            blocks.append(
+                'resource "aws_db_subnet_group" "rds_subnet_group" {\n'
+                '  name       = "rds-subnet-group"\n'
+                f'  subnet_ids = [{subnet_ids_hcl}]\n'
+                '  tags       = { Name = "rds-subnet-group" }\n'
                 '}\n'
             )
 
@@ -529,34 +569,85 @@ class TerraformGenerator:
 
     def _inject_scaffold_nodes(self) -> None:
         """
-        When compute resources need a subnet but none exists in the workflow,
-        inject synthetic VPC + Subnet nodes so reference resolution produces
-        valid HCL instead of missing ``subnet_id``.
+        Inject synthetic nodes so reference resolution produces valid HCL
+        when expected resources are absent from the workflow.
         """
+        # VPC + Subnet scaffold: needed when compute nodes exist but no subnet
         has_subnet = any(n.type == "subnet" for n in self.nodes.values())
         needs_subnet = any(n.type in _SUBNET_DEPENDENT_TYPES for n in self.nodes.values())
 
-        if not needs_subnet or has_subnet:
-            return
+        if needs_subnet and not has_subnet:
+            has_vpc = any(n.type == "vpc" for n in self.nodes.values())
 
-        has_vpc = any(n.type == "vpc" for n in self.nodes.values())
+            if not has_vpc:
+                self.nodes["__scaffold_vpc__"] = WorkflowNode(
+                    id="__scaffold_vpc__",
+                    type="vpc",
+                    position={"x": 0, "y": 0},
+                    config={"nodeName": "cloudkraft_vpc"},
+                    connections=[],
+                )
 
-        if not has_vpc:
-            self.nodes["__scaffold_vpc__"] = WorkflowNode(
-                id="__scaffold_vpc__",
-                type="vpc",
+            self.nodes["__scaffold_subnet__"] = WorkflowNode(
+                id="__scaffold_subnet__",
+                type="subnet",
                 position={"x": 0, "y": 0},
-                config={"nodeName": "cloudkraft_vpc"},
+                config={"nodeName": "cloudkraft_subnet"},
                 connections=[],
             )
 
-        self.nodes["__scaffold_subnet__"] = WorkflowNode(
-            id="__scaffold_subnet__",
-            type="subnet",
-            position={"x": 0, "y": 0},
-            config={"nodeName": "cloudkraft_subnet"},
-            connections=[],
+        # EIP scaffold: public NAT Gateways require allocation_id (Elastic IP).
+        # Inject a synthetic EIP so the reference resolves without user placing one on canvas.
+        # Skip if user manually provided allocation_id in the NAT gateway config.
+        has_natgateway = any(n.type == "natgateway" for n in self.nodes.values())
+        has_eip = any(n.type == "eip" for n in self.nodes.values())
+        has_manual_allocation = any(
+            n.type == "natgateway" and (
+                (n.config or {}).get("allocation_id") or (n.config or {}).get("nodeAllocationId")
+            )
+            for n in self.nodes.values()
         )
+        if has_natgateway and not has_eip and not has_manual_allocation:
+            self.nodes["__scaffold_eip__"] = WorkflowNode(
+                id="__scaffold_eip__",
+                type="eip",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "nat_eip", "domain": "vpc"},
+                connections=[],
+            )
+
+        # Second subnet scaffold: ALB and RDS DB subnet groups require ≥2 subnets in different AZs.
+        has_lb = any(n.type == "loadbalancer" for n in self.nodes.values())
+        has_rds_for_subnet = any(n.type == "rds" for n in self.nodes.values())
+        subnet_count = sum(1 for n in self.nodes.values() if n.type == "subnet")
+        if (has_lb or has_rds_for_subnet) and subnet_count == 1:
+            # Pin the existing user subnet to us-east-1a so scaffold subnet 2 (us-east-1b) is different.
+            for n in self.nodes.values():
+                if n.type == "subnet" and n.id not in _SCAFFOLD_IDS:
+                    cfg = dict(n.config or {})
+                    if not cfg.get("nodeAz") and not cfg.get("availability_zone"):
+                        cfg["nodeAz"] = "us-east-1a"
+                        n.config = cfg
+                    break
+            self.nodes["__scaffold_subnet_2__"] = WorkflowNode(
+                id="__scaffold_subnet_2__",
+                type="subnet",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "cloudkraft_subnet_2", "nodeAz": "us-east-1b"},
+                connections=[],
+            )
+
+        # DB Subnet Group scaffold: RDS requires aws_db_subnet_group, not a raw subnet ID.
+        has_rds = any(n.type == "rds" for n in self.nodes.values())
+        has_db_subnet_group = any(n.type == "dbsubnetgroup" for n in self.nodes.values())
+        if has_rds and not has_db_subnet_group:
+            self.nodes["__scaffold_db_subnet_group__"] = WorkflowNode(
+                id="__scaffold_db_subnet_group__",
+                type="dbsubnetgroup",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "rds_subnet_group"},
+                connections=[],
+            )
 
     # ------------------------------------------------------------------
     # Dependency ordering (topological sort)
@@ -661,6 +752,12 @@ class TerraformGenerator:
 
             # 1. Reference attribute
             if attr_name in REFERENCE_ATTRIBUTE_MAP:
+                # subnets / vpc_zone_identifier for ALB/ASG: collect ALL subnet refs
+                if attr_name in ("subnets", "vpc_zone_identifier", "subnet_ids"):
+                    all_refs = self._find_all_resource_references("subnet", node, "id")
+                    if all_refs:
+                        lines.append(f'{attr_name} = [{", ".join(all_refs)}]')
+                        continue
                 ref_line = self._resolve_reference_attr(attr_name, node)
                 if ref_line:
                     lines.append(ref_line)
@@ -734,6 +831,54 @@ class TerraformGenerator:
                 "}",
             ]
 
+        if terraform_type == "aws_security_group":
+            import ipaddress
+            # Resolve ingress CIDR: user config → validate → fallback 0.0.0.0/0
+            raw_cidr = (
+                config.get("nodeIngressCidr")
+                or config.get("nodeCidr")
+                or config.get("cidr_blocks")
+                or config.get("ingressCidr")
+            )
+            if raw_cidr:
+                try:
+                    ipaddress.ip_network(str(raw_cidr), strict=False)
+                    ingress_cidr = str(raw_cidr)
+                except ValueError:
+                    ingress_cidr = "0.0.0.0/0"
+            else:
+                ingress_cidr = "0.0.0.0/0"
+
+            lines += [
+                "ingress {",
+                '  description = "HTTP"',
+                "  from_port   = 80",
+                "  to_port     = 80",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "ingress {",
+                '  description = "HTTPS"',
+                "  from_port   = 443",
+                "  to_port     = 443",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "ingress {",
+                '  description = "SSH"',
+                "  from_port   = 22",
+                "  to_port     = 22",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "egress {",
+                "  from_port   = 0",
+                "  to_port     = 0",
+                '  protocol    = "-1"',
+                '  cidr_blocks = ["0.0.0.0/0"]',
+                "}",
+            ]
+
         if terraform_type == "aws_cloudfront_distribution":
             # Prefer connected S3 bucket's regional domain, fallback to config/placeholder
             s3_domain_ref = self._find_resource_reference("s3", node, "bucket_regional_domain_name")
@@ -768,11 +913,13 @@ class TerraformGenerator:
 
         # Schema-required blocks that have no template yet
         already_emitted = set(templates.keys()) | {
-            "attribute",       # dynamodb handled above
-            "origin",          # cloudfront handled above
-            "default_cache_behavior",  # cloudfront template
-            "restrictions",            # cloudfront template
-            "viewer_certificate",      # cloudfront template
+            "attribute",              # dynamodb handled above
+            "ingress",                # security_group handled above
+            "egress",                 # security_group handled above
+            "origin",                 # cloudfront handled above
+            "default_cache_behavior", # cloudfront handled above
+            "restrictions",           # cloudfront template
+            "viewer_certificate",     # cloudfront template
         }
         for block_name, block_def in block_type_defs.items():
             if block_name in already_emitted:
@@ -828,6 +975,28 @@ class TerraformGenerator:
                 return self._ref_expr(other, attr)
 
         return None
+
+    def _find_all_resource_references(
+        self, resource_type: str, node: WorkflowNode, attr: str = "id"
+    ) -> List[str]:
+        """Return HCL reference expressions for ALL nodes of *resource_type* in the workflow."""
+        seen: set = set()
+        refs: List[str] = []
+
+        # Direct connections first
+        for conn_id in node.connections:
+            connected = self.nodes.get(conn_id)
+            if connected and connected.type == resource_type and conn_id not in seen:
+                refs.append(self._ref_expr(connected, attr))
+                seen.add(conn_id)
+
+        # All other nodes of that type
+        for other_id, other in self.nodes.items():
+            if other.type == resource_type and other_id != node.id and other_id not in seen:
+                refs.append(self._ref_expr(other, attr))
+                seen.add(other_id)
+
+        return refs
 
     def _ref_expr(self, node: WorkflowNode, attr: str) -> str:
         """Build a HCL reference expression, e.g. ``aws_vpc.main_vpc.id``."""
