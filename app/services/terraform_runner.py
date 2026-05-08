@@ -155,6 +155,29 @@ def prewarm_plugin_cache() -> None:
     thread.start()
 
 
+def _hardlink_or_copy(src: str, dst: str) -> None:
+    """Hard-link src→dst if on same filesystem, otherwise fall back to copy."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _hardlink_provider_into(tmpdir: str) -> None:
+    """
+    Recreate the .terraform/providers directory in tmpdir by following the warm
+    workspace symlinks and hard-linking actual files.  Hard links are instant
+    (no data copy) and give each tmpdir its own inode path, eliminating the
+    shared plugin-cache lock contention that caused terraform validate to hang.
+    """
+    warm_tf = WARM_WORKSPACE_DIR / ".terraform"
+    dest_tf = Path(tmpdir) / ".terraform"
+    # symlinks=False → follow symlinks into the plugin cache; _hardlink_or_copy
+    # → hard-link binaries instead of copying 680 MB
+    shutil.copytree(str(warm_tf), str(dest_tf), symlinks=False,
+                    copy_function=_hardlink_or_copy)
+
+
 def run_terraform_validate(files: Dict[str, str]) -> Dict[str, Any]:
     """
     Validate a set of Terraform files using the real terraform binary.
@@ -177,25 +200,40 @@ def run_terraform_validate(files: Dict[str, str]) -> Dict[str, Any]:
         for filename, content in files.items():
             (Path(tmpdir) / filename).write_text(content, encoding="utf-8")
 
+        # Override provider to skip credential validation — keeps validate fast
+        # (without this, the AWS provider spends seconds trying to resolve creds)
+        (Path(tmpdir) / "_cloudkraft_validate_override.tf").write_text(
+            'provider "aws" {\n'
+            '  skip_credentials_validation = true\n'
+            '  skip_requesting_account_id  = true\n'
+            '  skip_metadata_api_check     = true\n'
+            '  access_key                  = "mock_access_key"\n'
+            '  secret_key                  = "mock_secret_key"\n'
+            '}\n',
+            encoding="utf-8",
+        )
+
         env = _build_tf_env()
 
-        # ── Fast path: copy warm workspace so we can skip terraform init ─────
+        # ── Fast path: hard-link provider binary so we can skip terraform init ──
+        # Symlinks to the shared plugin cache cause inter-process lock deadlocks.
+        # Hard links are instant (no data copy) and each tmpdir gets its own path.
         if _warm_workspace_ready():
             try:
-                warm_tf = WARM_WORKSPACE_DIR / ".terraform"
-                dest_tf = Path(tmpdir) / ".terraform"
-                shutil.copytree(str(warm_tf), str(dest_tf), symlinks=True)
-
+                _hardlink_provider_into(tmpdir)
                 warm_lock = WARM_WORKSPACE_DIR / ".terraform.lock.hcl"
                 if warm_lock.exists():
                     shutil.copy2(str(warm_lock), str(Path(tmpdir) / ".terraform.lock.hcl"))
 
-                logger.debug("Copied warm workspace — skipping terraform init")
-                # Jump straight to validate
+                logger.debug("Hard-linked provider into tmpdir — skipping terraform init")
+                # Remove TF_PLUGIN_CACHE_DIR so terraform doesn't touch the shared cache
+                env.pop("TF_PLUGIN_CACHE_DIR", None)
                 return _run_validate_only(tmpdir, env)
-            except Exception as copy_err:
-                logger.warning("Failed to copy warm workspace (%s) — falling back to init", copy_err)
-                # Clean up any partial copy and fall through to the slow path
+            except (OSError, shutil.Error) as copy_err:
+                # Only catch filesystem/copy errors here — timeout from _run_validate_only
+                # must propagate to the outer TimeoutExpired handler, not fall to slow path
+                logger.warning("Failed to set up validation workspace (%s) — falling back to init", copy_err)
+                # Clean up any partial setup and fall through to the slow path
                 dest = Path(tmpdir) / ".terraform"
                 if dest.exists():
                     shutil.rmtree(dest, ignore_errors=True)
@@ -256,17 +294,48 @@ def run_terraform_validate(files: Dict[str, str]) -> Dict[str, Any]:
 
 
 def _run_validate_only(tmpdir: str, env: Dict[str, str]) -> Dict[str, Any]:
-    """Run `terraform validate -json` in an already-initialised tmpdir."""
-    validate = subprocess.run(
-        [_TERRAFORM_BIN, "validate", "-json", "-no-color"],
-        cwd=tmpdir,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env=env,
-    )
+    """Run `terraform validate -json` in an already-initialised tmpdir.
 
-    raw = validate.stdout.strip() or validate.stderr.strip()
+    Uses a temp file for stdout instead of a pipe to avoid a hang: terraform
+    starts the AWS provider as a gRPC child process that inherits the pipe's
+    write-end.  When terraform exits, the plugin keeps the pipe open, causing
+    subprocess.communicate() to block forever waiting for EOF.  Writing to a
+    file and calling proc.wait() avoids this — we only wait for terraform itself.
+    """
+    import tempfile as _tempfile
+    out_fd, out_path = _tempfile.mkstemp(suffix=".json", prefix="tf_validate_")
+    try:
+        with os.fdopen(out_fd, "w") as out_file:
+            proc = subprocess.Popen(
+                [_TERRAFORM_BIN, "validate", "-json", "-no-color"],
+                cwd=tmpdir,
+                stdout=out_file,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                start_new_session=True,  # own process group for clean teardown
+            )
+        # Wait only for terraform itself — provider plugin child may linger
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise
+        finally:
+            # Kill any lingering provider plugin processes in the same group
+            try:
+                import signal as _signal
+                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass  # process group already gone
+
+        with open(out_path, encoding="utf-8") as f:
+            raw = f.read().strip()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:

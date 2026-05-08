@@ -99,6 +99,7 @@ class TerraformValidator:
                 "aws_iam_role":              self._check_iam_role,
                 "aws_lb":                    self._check_alb,
                 "aws_dynamodb_table":        self._check_dynamodb,
+                "aws_autoscaling_group":     self._check_autoscaling_group,
             }
             if rtype in dispatch:
                 dispatch[rtype](block, rname, i)
@@ -198,6 +199,22 @@ class TerraformValidator:
             self.warnings.append(ValidationError(
                 type="schema", severity="warning", line=line, resource=ref,
                 message=f"DynamoDB table '{name}' does not specify 'billing_mode' — defaults to PROVISIONED which requires capacity units",
+            ))
+
+    def _check_autoscaling_group(self, block: str, name: str, line: int):
+        ref = f"aws_autoscaling_group.{name}"
+        has_launch = (
+            "launch_configuration" in block
+            or "launch_template" in block
+            or "mixed_instances_policy" in block
+        )
+        if not has_launch:
+            self.errors.append(ValidationError(
+                type="schema", severity="error", line=line, resource=ref,
+                message=(
+                    f"Auto Scaling group '{name}' must specify one of "
+                    "'launch_configuration', 'launch_template', or 'mixed_instances_policy'"
+                ),
             ))
 
     # ------------------------------------------------------------------

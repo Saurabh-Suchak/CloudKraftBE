@@ -34,6 +34,12 @@ _run_column_migrations()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Kill any provider plugin processes left over from a previous server run
+    import subprocess as _sp
+    try:
+        _sp.run(["pkill", "-9", "-f", "terraform-provider-aws"], capture_output=True)
+    except Exception:
+        pass
     # Kick off terraform provider download in background so first validation is fast
     prewarm_plugin_cache()
     yield

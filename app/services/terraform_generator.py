@@ -303,6 +303,15 @@ RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
 BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
     # aws_security_group ingress/egress handled dynamically in _generate_nested_blocks
     # so CIDR can be taken from user config or defaulted to 0.0.0.0/0
+    # aws_autoscaling_group requires exactly one of launch_configuration,
+    # launch_template, or mixed_instances_policy (AWS provider ExactlyOneOf).
+    # Emit a launch_template block with a placeholder so generated HCL is valid.
+    "aws_autoscaling_group": {
+        "launch_template": [
+            'id      = "lt-00000000000000000"  # Replace with your aws_launch_template resource ID',
+            'version = "$Latest"',
+        ],
+    },
     "aws_cloudfront_distribution": {
         "restrictions": [
             "geo_restriction {",
@@ -822,6 +831,18 @@ class TerraformGenerator:
             lines.append("}")
 
         # Resource-specific dynamic blocks not covered by templates
+        if terraform_type == "aws_security_group":
+            ingress_cidr = (config or {}).get("nodeIngressCidr") or "0.0.0.0/0"
+            lines += [
+                "ingress {",
+                '  description = "Allow SSH"',
+                "  from_port   = 22",
+                "  to_port     = 22",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+            ]
+
         if terraform_type == "aws_dynamodb_table":
             hash_key = self._get_config_value("hash_key", config) or "id"
             lines += [
