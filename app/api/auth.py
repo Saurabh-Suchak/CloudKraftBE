@@ -20,6 +20,7 @@ from app.schemas.user import (
     Token,
     UpdateProfileRequest,
     UserAWSRegister,
+    UserAWSRoleAuth,
     UserCreate,
     UserResponse,
 )
@@ -171,7 +172,7 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         max_age=max_age,
         httponly=True,
         secure=settings.COOKIE_SECURE,
-        samesite="lax",
+        samesite="none" if settings.COOKIE_SECURE else "lax",
         path="/",
     )
 
@@ -217,18 +218,38 @@ def logout(response: Response):
     return {"message": "Logged out"}
 
 
-@router.post("/aws-register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/aws-register", response_model=Token, status_code=status.HTTP_201_CREATED)
 @limiter.limit("10/minute")
-def register_with_aws(request: Request, user_data: UserAWSRegister, db: Session = Depends(get_db)):
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered",
-        )
-
+def register_with_aws(request: Request, response: Response, user_data: UserAWSRegister, db: Session = Depends(get_db)):
     import boto3
     from botocore.exceptions import ClientError, NoCredentialsError
+
+    existing_user = db.query(User).filter(User.email == user_data.email).first()
+    if existing_user:
+        # Re-auth: validate credentials and issue new token
+        if existing_user.auth_method != "access_key":
+            raise HTTPException(status_code=400, detail="Account uses a different auth method")
+        try:
+            sts = boto3.client(
+                "sts",
+                aws_access_key_id=user_data.aws_access_key,
+                aws_secret_access_key=user_data.aws_secret_key,
+                region_name=user_data.aws_region,
+            )
+            sts.get_caller_identity()
+        except (ClientError, NoCredentialsError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid AWS credentials: {e}")
+        salt = existing_user.credential_salt
+        existing_user.aws_access_key = encrypt_aws_credentials(user_data.aws_access_key, user_salt=salt)
+        existing_user.aws_secret_key = encrypt_aws_credentials(user_data.aws_secret_key, user_salt=salt)
+        existing_user.aws_region = user_data.aws_region
+        db.commit()
+        _write_audit(db, "aws_reauth", user_id=existing_user.id,
+                     ip=request.client.host if request.client else None)
+        access_token = create_access_token(data={"sub": existing_user.email})
+        _set_auth_cookie(response, access_token)
+        return {"access_token": access_token, "token_type": "bearer"}
+
     try:
         sts = boto3.client(
             "sts",
@@ -258,7 +279,76 @@ def register_with_aws(request: Request, user_data: UserAWSRegister, db: Session 
 
     _write_audit(db, "aws_register", user_id=db_user.id,
                  ip=request.client.host if request.client else None)
-    return db_user
+    access_token = create_access_token(data={"sub": db_user.email})
+    _set_auth_cookie(response, access_token)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@router.post("/aws-role-auth", response_model=Token)
+@limiter.limit("10/minute")
+def aws_role_auth(request: Request, response: Response, user_data: UserAWSRoleAuth, db: Session = Depends(get_db)):
+    """Register or re-authenticate using IAM Role assumption."""
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+
+    existing_user = db.query(User).filter(User.email == user_data.email).first()
+
+    if existing_user:
+        if existing_user.auth_method != "assume_role":
+            raise HTTPException(status_code=400, detail="Account uses a different auth method")
+        if existing_user.role_arn and existing_user.role_arn != user_data.role_arn:
+            raise HTTPException(status_code=400, detail="Role ARN does not match registered account")
+        stored_external_id = _safe_decrypt(existing_user, "external_id", db)
+        try:
+            sts = boto3.client("sts")
+            assume_params: dict = {
+                "RoleArn": user_data.role_arn,
+                "RoleSessionName": "cloudkraft-reauth",
+            }
+            if stored_external_id:
+                assume_params["ExternalId"] = stored_external_id
+            sts.assume_role(**assume_params)
+        except (ClientError, NoCredentialsError) as e:
+            raise HTTPException(status_code=400, detail=f"Cannot assume role: {e}")
+        existing_user.aws_region = user_data.region
+        db.commit()
+        _write_audit(db, "aws_role_reauth", user_id=existing_user.id,
+                     ip=request.client.host if request.client else None)
+        access_token = create_access_token(data={"sub": existing_user.email})
+        _set_auth_cookie(response, access_token)
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    # New registration
+    salt = generate_credential_salt()
+    try:
+        sts = boto3.client("sts")
+        sts.assume_role(
+            RoleArn=user_data.role_arn,
+            RoleSessionName="cloudkraft-register",
+            ExternalId=user_data.external_id,
+        )
+    except (ClientError, NoCredentialsError) as e:
+        raise HTTPException(status_code=400, detail=f"Cannot assume role: {e}")
+
+    db_user = User(
+        email=user_data.email,
+        password_hash=get_password_hash(_secrets.token_urlsafe(32)),
+        full_name=user_data.full_name or user_data.email.split("@")[0],
+        credential_salt=salt,
+        aws_region=user_data.region,
+        auth_method="assume_role",
+        role_arn=user_data.role_arn,
+        external_id=encrypt_aws_credentials(user_data.external_id, user_salt=salt),
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
+    _write_audit(db, "aws_role_register", user_id=db_user.id,
+                 ip=request.client.host if request.client else None)
+    access_token = create_access_token(data={"sub": db_user.email})
+    _set_auth_cookie(response, access_token)
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # ---------------------------------------------------------------------------
@@ -507,5 +597,5 @@ def update_env_vars(
 
 
 @router.get("/platform-info")
-def platform_info(_: User = Depends(get_current_user)):
+def platform_info():
     return {"cloudkraft_iam_arn": settings.CLOUDKRAFT_IAM_ARN}

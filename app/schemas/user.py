@@ -20,6 +20,14 @@ class UserAWSRegister(BaseModel):
     aws_region: str
 
 
+class UserAWSRoleAuth(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    role_arn: str
+    external_id: str
+    region: str
+
+
 class ConnectAWSRequest(BaseModel):
     auth_method: Literal["access_key", "assume_role"]
     region: str
