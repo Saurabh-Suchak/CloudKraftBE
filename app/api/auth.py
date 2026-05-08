@@ -171,7 +171,7 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         max_age=max_age,
         httponly=True,
         secure=settings.COOKIE_SECURE,
-        samesite="lax",
+        samesite="none" if settings.COOKIE_SECURE else "lax",
         path="/",
     )
 
@@ -507,5 +507,5 @@ def update_env_vars(
 
 
 @router.get("/platform-info")
-def platform_info(_: User = Depends(get_current_user)):
+def platform_info():
     return {"cloudkraft_iam_arn": settings.CLOUDKRAFT_IAM_ARN}
