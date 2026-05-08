@@ -52,8 +52,6 @@ alembic/versions/*.pyc
 .DS_Store
 Thumbs.db
 
-app/data/aws_provider_schema.json
-
 # Terraform provider cache (large binaries)
 app/data/terraform_plugin_cache/
 app/data/terraform_warm_workspace/
