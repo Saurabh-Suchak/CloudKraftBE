@@ -465,6 +465,7 @@ class TerraformGenerator:
                 'resource "aws_subnet" "cloudkraft_subnet" {\n'
                 f'  vpc_id                  = {vpc_ref}\n'
                 '  cidr_block              = "10.0.1.0/24"\n'
+                '  availability_zone       = "us-east-1a"\n'
                 '  map_public_ip_on_launch = true\n'
                 '  tags = { Name = "cloudkraft-subnet" }\n'
                 '}\n'
@@ -615,10 +616,19 @@ class TerraformGenerator:
                 connections=[],
             )
 
-        # Second subnet scaffold: ALB requires ≥2 subnets in different AZs.
+        # Second subnet scaffold: ALB and RDS DB subnet groups require ≥2 subnets in different AZs.
         has_lb = any(n.type == "loadbalancer" for n in self.nodes.values())
+        has_rds_for_subnet = any(n.type == "rds" for n in self.nodes.values())
         subnet_count = sum(1 for n in self.nodes.values() if n.type == "subnet")
-        if has_lb and subnet_count == 1:
+        if (has_lb or has_rds_for_subnet) and subnet_count == 1:
+            # Pin the existing user subnet to us-east-1a so scaffold subnet 2 (us-east-1b) is different.
+            for n in self.nodes.values():
+                if n.type == "subnet" and n.id not in _SCAFFOLD_IDS:
+                    cfg = dict(n.config or {})
+                    if not cfg.get("nodeAz") and not cfg.get("availability_zone"):
+                        cfg["nodeAz"] = "us-east-1a"
+                        n.config = cfg
+                    break
             self.nodes["__scaffold_subnet_2__"] = WorkflowNode(
                 id="__scaffold_subnet_2__",
                 type="subnet",
