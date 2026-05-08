@@ -246,8 +246,8 @@ RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
     "aws_db_instance": {
         "allocated_storage": "20",
         "storage_type":      '"gp2"',
-        "username":          '"admin"',
-        "password":          '"changeme"',
+        "username":          "var.db_username",
+        "password":          "var.db_password",  # F-005: never hardcode; generated in tfvars
         "engine":            '"mysql"',
         "instance_class":    '"db.t2.micro"',
     },
@@ -354,28 +354,35 @@ class TerraformGenerator:
     # Public entry points
     # ------------------------------------------------------------------
 
-    def generate_files(self, workflow_state: WorkflowState) -> Dict[str, str]:
+    def generate_files(self, workflow_state: WorkflowState, state_key: str = "") -> Dict[str, str]:
         """
         Generate all Terraform project files.
 
         Returns an ordered dict of filename → content:
-            versions.tf     – terraform{} block + provider block
+            versions.tf     – terraform{} + provider block
+            backend.tf      – S3 remote backend (only when TF_STATE_BUCKET is set)
             variables.tf    – variable declarations
-            main.tf         – resource blocks only
-            outputs.tf      – output blocks for every resource
+            main.tf         – resource blocks
+            outputs.tf      – output blocks
             terraform.tfvars – concrete variable values
         """
         self.nodes = {n.id: n for n in workflow_state.nodes}
         self._inject_scaffold_nodes()
         dependency_order = self._get_dependency_order()
 
-        return {
+        files: Dict[str, str] = {
             "versions.tf":      self._generate_versions_tf(),
             "variables.tf":     self._generate_variables_tf(workflow_state),
             "main.tf":          self._generate_main_tf(dependency_order),
             "outputs.tf":       self._generate_outputs_tf(),
             "terraform.tfvars": self._generate_tfvars(workflow_state),
         }
+
+        backend = self._generate_backend_tf(state_key)
+        if backend:
+            files["backend.tf"] = backend
+
+        return files
 
     def generate(self, workflow_state: WorkflowState) -> str:
         """
@@ -392,6 +399,28 @@ class TerraformGenerator:
     # ------------------------------------------------------------------
     # Per-file generators
     # ------------------------------------------------------------------
+
+    def _generate_backend_tf(self, state_key: str) -> str:
+        """Return backend.tf content for S3 remote state, or empty string when not configured."""
+        from app.config import settings
+        if not settings.TF_STATE_BUCKET or not state_key:
+            return ""
+
+        lock_line = (
+            f'    dynamodb_table = "{settings.TF_STATE_LOCK_TABLE}"\n'
+            if settings.TF_STATE_LOCK_TABLE else ""
+        )
+        return (
+            'terraform {\n'
+            '  backend "s3" {\n'
+            f'    bucket  = "{settings.TF_STATE_BUCKET}"\n'
+            f'    key     = "{state_key}"\n'
+            f'    region  = "{settings.TF_STATE_REGION}"\n'
+            '    encrypt = true\n'
+            f'{lock_line}'
+            '  }\n'
+            '}\n'
+        )
 
     def _generate_versions_tf(self) -> str:
         return (
@@ -411,7 +440,6 @@ class TerraformGenerator:
         )
 
     def _generate_variables_tf(self, workflow_state: WorkflowState) -> str:
-        # Detect the region from any node config that has nodeRegion set
         region = "us-east-1"
         for node in workflow_state.nodes:
             r = (node.config or {}).get("nodeRegion")
@@ -427,6 +455,25 @@ class TerraformGenerator:
             '}',
             '',
         ]
+
+        # F-005: emit RDS credential variables only when an RDS node is present
+        has_rds = any(n.type == "rds" for n in workflow_state.nodes)
+        if has_rds:
+            lines += [
+                'variable "db_username" {',
+                '  description = "RDS master username"',
+                '  type        = string',
+                '  default     = "admin"',
+                '}',
+                '',
+                'variable "db_password" {',
+                '  description = "RDS master password — change before deploying to production"',
+                '  type        = string',
+                '  sensitive   = true',
+                '}',
+                '',
+            ]
+
         return "\n".join(lines)
 
     def _generate_main_tf(self, dependency_order: List[str]) -> str:
@@ -563,6 +610,8 @@ class TerraformGenerator:
         return "\n".join(lines)
 
     def _generate_tfvars(self, workflow_state: WorkflowState) -> str:
+        import secrets as _secrets
+
         region = "us-east-1"
         for node in workflow_state.nodes:
             r = (node.config or {}).get("nodeRegion")
@@ -570,7 +619,21 @@ class TerraformGenerator:
                 region = r
                 break
 
-        return f'aws_region = "{region}"\n'
+        lines = [f'aws_region = "{region}"']
+
+        # F-005: generate a random strong password for RDS at deployment time.
+        # The caller (user) should rotate this after first deploy and store it
+        # in a secrets manager — it is intentionally not shown in the UI.
+        has_rds = any(n.type == "rds" for n in workflow_state.nodes)
+        if has_rds:
+            db_pw = _secrets.token_urlsafe(24)
+            lines += [
+                'db_username = "admin"',
+                f'db_password = "{db_pw}"',
+                '# IMPORTANT: rotate db_password after first deployment and store in a secrets manager',
+            ]
+
+        return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------------
     # Scaffold injection
@@ -793,7 +856,9 @@ class TerraformGenerator:
         if "tags" in attrs and not schema.is_computed_only(terraform_type, "tags"):
             name = config.get("nodeName") or config.get("name")
             if name:
-                lines.append(f'tags = {{ Name = "{name}" }}')
+                # F-001: escape the name so a crafted value cannot break out of the string
+                safe_name = self._escape_hcl_string(str(name))
+                lines.append(f'tags = {{ Name = "{safe_name}" }}')
 
         return lines
 
@@ -1058,6 +1123,24 @@ class TerraformGenerator:
     # HCL value formatting
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _escape_hcl_string(value: str) -> str:
+        """Escape a string so it is safe to embed inside HCL double-quotes.
+
+        Prevents HCL injection (F-001): a crafted nodeName like
+        ``x" } resource "null_resource" "pwn" { provisioner "local-exec" ...``
+        would break out of the surrounding string and inject arbitrary Terraform.
+        """
+        return (
+            value
+            .replace("\\", "\\\\")   # must be first
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("${", "$${")    # prevent Terraform template interpolation
+            .replace("%{", "%%{")    # prevent Terraform directive interpolation
+        )
+
     def _format_hcl_value(self, value: Any, attr_type: Any = "string") -> str:
         """
         Convert a Python value to an HCL literal, guided by the schema type.
@@ -1088,7 +1171,8 @@ class TerraformGenerator:
         if "bool" in type_str:
             return "true" if str(value).lower() in ("true", "1", "yes") else "false"
 
-        return f'"{value}"'
+        # F-001: escape all string values before embedding in HCL
+        return f'"{self._escape_hcl_string(str(value))}"'
 
     # ------------------------------------------------------------------
     # Fallback: config-only generation (no schema)
@@ -1130,6 +1214,10 @@ def generate_terraform(workflow_state: WorkflowState) -> str:
     return TerraformGenerator().generate(workflow_state)
 
 
-def generate_terraform_files(workflow_state: WorkflowState, suffix: str = "") -> Dict[str, str]:
+def generate_terraform_files(
+    workflow_state: WorkflowState,
+    suffix: str = "",
+    state_key: str = "",
+) -> Dict[str, str]:
     """Return a dict of filename → content for all Terraform project files."""
-    return TerraformGenerator(suffix=suffix).generate_files(workflow_state)
+    return TerraformGenerator(suffix=suffix).generate_files(workflow_state, state_key=state_key)

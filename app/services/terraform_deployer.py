@@ -1,4 +1,5 @@
 import logging
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -22,11 +23,23 @@ logger = logging.getLogger(__name__)
 
 WORKSPACES_DIR = Path(__file__).parent.parent / "data" / "workspaces"
 
+_SENSITIVE_PATTERNS = [
+    (re.compile(r'\b(AKIA|ASIA)[A-Z0-9]{16}\b'), "***AWS_KEY***"),
+    (re.compile(r'(?i)(secret[_\-]?key|aws_secret|password|token|api[_\-]?key)\s*[=:]\s*\S+'), "***REDACTED***"),
+    (re.compile(r'gAAAAA[A-Za-z0-9+/\-_]{50,}={0,2}'), "***ENCRYPTED***"),
+]
+
+
+def _scrub_log(message: str) -> str:
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        message = pattern.sub(replacement, message)
+    return message
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 def _add_log(db, deployment_id: int, message: str, level: str = "info") -> None:
-    db.add(DeploymentLog(deployment_id=deployment_id, message=message, level=level))
+    db.add(DeploymentLog(deployment_id=deployment_id, message=_scrub_log(message), level=level))
     db.commit()
 
 
@@ -38,6 +51,17 @@ def _set_status(db, deployment: Deployment, status: str, **kwargs) -> None:
 
 
 # ── AWS env ───────────────────────────────────────────────────────────────────
+
+def _decrypt_or_raise(value: str, salt: str, field: str) -> str:
+    from cryptography.fernet import InvalidToken
+    try:
+        return decrypt_aws_credentials(value, user_salt=salt)
+    except (InvalidToken, Exception):
+        raise RuntimeError(
+            f"AWS credentials could not be decrypted ({field}). "
+            "Please reconnect your AWS account in Profile → AWS Connect."
+        )
+
 
 def _aws_env(user) -> Dict[str, str]:
     from app.config import settings
@@ -57,7 +81,13 @@ def _aws_env(user) -> Dict[str, str]:
             "RoleSessionName": "cloudkraft-deploy",
         }
         if user.external_id:
-            assume_params["ExternalId"] = decrypt_aws_credentials(user.external_id)
+            from cryptography.fernet import InvalidToken
+            try:
+                assume_params["ExternalId"] = decrypt_aws_credentials(
+                    user.external_id, user_salt=user.credential_salt
+                )
+            except (InvalidToken, Exception):
+                pass
 
         resp = sts.assume_role(**assume_params)
         creds = resp["Credentials"]
@@ -66,13 +96,44 @@ def _aws_env(user) -> Dict[str, str]:
         env["AWS_SESSION_TOKEN"] = creds["SessionToken"]
     else:
         if user.aws_access_key:
-            env["AWS_ACCESS_KEY_ID"] = decrypt_aws_credentials(user.aws_access_key)
+            env["AWS_ACCESS_KEY_ID"] = _decrypt_or_raise(
+                user.aws_access_key, user.credential_salt, "aws_access_key"
+            )
         if user.aws_secret_key:
-            env["AWS_SECRET_ACCESS_KEY"] = decrypt_aws_credentials(user.aws_secret_key)
+            env["AWS_SECRET_ACCESS_KEY"] = _decrypt_or_raise(
+                user.aws_secret_key, user.credential_salt, "aws_secret_key"
+            )
 
     env["AWS_DEFAULT_REGION"] = region
     env["AWS_REGION"] = region
     return env
+
+
+# ── S3 remote state helpers ───────────────────────────────────────────────────
+
+def _state_key(user_id: int, deployment_id: int) -> str:
+    """S3 object key for a deployment's state file."""
+    return f"deployments/{user_id}/{deployment_id}/terraform.tfstate"
+
+
+def _backend_init_args(state_key: str) -> List[str]:
+    """Return extra -backend-config flags for terraform init when S3 is configured.
+
+    Credentials for the state bucket come from the platform's own keys so that
+    user credentials never need access to the state bucket.
+    """
+    from app.config import settings
+    if not settings.TF_STATE_BUCKET or not state_key:
+        return []
+
+    args = [f"-backend-config=key={state_key}"]
+    if settings.BACKEND_AWS_ACCESS_KEY:
+        args += [
+            f"-backend-config=access_key={settings.BACKEND_AWS_ACCESS_KEY}",
+            f"-backend-config=secret_key={settings.BACKEND_AWS_SECRET_KEY}",
+            f"-backend-config=region={settings.TF_STATE_REGION}",
+        ]
+    return args
 
 
 # ── Subprocess helper ─────────────────────────────────────────────────────────
@@ -143,6 +204,98 @@ def _prepare_workspace(workspace: Path, tf_files: Dict[str, str], db, deployment
     return True
 
 
+# ── Public: run plan ──────────────────────────────────────────────────────────
+
+def run_plan(deployment_id: int, workflow_state_dict: dict, user_id: int) -> None:
+    """F-012: run terraform plan, store output, set status to planned (or failed)."""
+    db = SessionLocal()
+    try:
+        from app.models.user import User
+        deployment = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not deployment or not user:
+            return
+
+        _set_status(db, deployment, "planning", started_at=datetime.now(timezone.utc))
+        _add_log(db, deployment_id, "Planning started")
+
+        has_access_key = user.auth_method == "access_key" and user.aws_access_key and user.aws_secret_key
+        has_assume_role = user.auth_method == "assume_role" and user.role_arn
+        if not has_access_key and not has_assume_role:
+            _add_log(db, deployment_id, "AWS credentials not found. Connect your AWS account first.", "error")
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+
+        _add_log(db, deployment_id, "Generating Terraform configuration...")
+        sk = _state_key(user_id, deployment_id)
+        try:
+            workflow_state = WorkflowState(**workflow_state_dict)
+            tf_files = generate_terraform_files(workflow_state, suffix=f"-ck{deployment_id}", state_key=sk)
+        except Exception as e:
+            _add_log(db, deployment_id, f"HCL generation failed: {e}", "error")
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+
+        workspace = WORKSPACES_DIR / str(deployment_id)
+        _prepare_workspace(workspace, tf_files, db, deployment_id)
+        deployment.workspace_path = str(workspace)
+        db.commit()
+
+        env = _aws_env(user)
+
+        _add_log(db, deployment_id, "Running terraform init...")
+        init_args = ["init", "-no-color", "-input=false"] + _backend_init_args(sk)
+        rc = _run_tf(str(workspace), init_args, env, db, deployment_id)
+        if rc != 0:
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+        _add_log(db, deployment_id, "✓ Init complete", "success")
+
+        # Run plan and capture output separately so we can store it
+        _add_log(db, deployment_id, "Running terraform plan...")
+        plan_file = workspace / "deploy.tfplan"
+        rc = _run_tf(str(workspace), ["plan", "-out", str(plan_file), "-no-color", "-input=false"], env, db, deployment_id)
+        if rc != 0:
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+
+        # Capture human-readable plan summary
+        plan_summary = _capture_plan_show(str(workspace), str(plan_file), env)
+        deployment.plan_output = plan_summary
+        _set_status(db, deployment, "planned")
+        _add_log(db, deployment_id, "✓ Plan complete — review and approve to apply", "success")
+
+    except Exception as e:
+        logger.exception("Plan %d crashed", deployment_id)
+        try:
+            dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+            if dep:
+                _add_log(db, deployment_id, f"Unexpected error: {e}", "error")
+                _set_status(db, dep, "failed", completed_at=datetime.now(timezone.utc))
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _capture_plan_show(workspace: str, plan_file: str, env: Dict) -> str:
+    """Return human-readable `terraform show` output for a saved plan file."""
+    if not _TERRAFORM_BIN:
+        return ""
+    try:
+        result = subprocess.run(
+            [_TERRAFORM_BIN, "show", "-no-color", plan_file],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        return _strip_ansi(result.stdout)[:32768]  # cap at 32 KiB
+    except Exception:
+        return ""
+
+
 # ── Public: run deployment ─────────────────────────────────────────────────────
 
 def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) -> None:
@@ -165,17 +318,16 @@ def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) 
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
             return
 
-        # Generate HCL
         _add_log(db, deployment_id, "Generating Terraform configuration...")
+        sk = _state_key(user_id, deployment_id)
         try:
             workflow_state = WorkflowState(**workflow_state_dict)
-            tf_files = generate_terraform_files(workflow_state, suffix=f"-ck{deployment_id}")
+            tf_files = generate_terraform_files(workflow_state, suffix=f"-ck{deployment_id}", state_key=sk)
         except Exception as e:
             _add_log(db, deployment_id, f"HCL generation failed: {e}", "error")
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
             return
 
-        # Setup workspace
         workspace = WORKSPACES_DIR / str(deployment_id)
         _prepare_workspace(workspace, tf_files, db, deployment_id)
         deployment.workspace_path = str(workspace)
@@ -183,9 +335,9 @@ def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) 
 
         env = _aws_env(user)
 
-        # terraform init
         _add_log(db, deployment_id, "Running terraform init...")
-        rc = _run_tf(str(workspace), ["init", "-no-color", "-input=false"], env, db, deployment_id)
+        init_args = ["init", "-no-color", "-input=false"] + _backend_init_args(sk)
+        rc = _run_tf(str(workspace), init_args, env, db, deployment_id)
         if rc != 0:
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
             return
@@ -206,10 +358,11 @@ def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) 
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
             return
 
-        # Store state
-        state_file = workspace / "terraform.tfstate"
-        if state_file.exists():
-            deployment.terraform_state = state_file.read_text(encoding="utf-8")
+        from app.config import settings as _settings
+        if not _settings.TF_STATE_BUCKET:
+            state_file = workspace / "terraform.tfstate"
+            if state_file.exists():
+                deployment.terraform_state = state_file.read_text(encoding="utf-8")
 
         resource_count = len(workflow_state.nodes)
         _set_status(db, deployment, "succeeded",
@@ -219,6 +372,75 @@ def run_deployment(deployment_id: int, workflow_state_dict: dict, user_id: int) 
 
     except Exception as e:
         logger.exception("Deployment %d crashed", deployment_id)
+        try:
+            dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+            if dep:
+                _add_log(db, deployment_id, f"Unexpected error: {e}", "error")
+                _set_status(db, dep, "failed", completed_at=datetime.now(timezone.utc))
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ── Public: apply a planned deployment ────────────────────────────────────────
+
+def run_apply_planned(deployment_id: int, user_id: int) -> None:
+    db = SessionLocal()
+    try:
+        from app.models.user import User
+        deployment = db.query(Deployment).filter(Deployment.id == deployment_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        if not deployment or not user:
+            return
+
+        _set_status(db, deployment, "running", started_at=datetime.now(timezone.utc))
+        _add_log(db, deployment_id, "Applying approved plan...")
+
+        workspace = Path(deployment.workspace_path) if deployment.workspace_path else None
+        if not workspace or not workspace.exists():
+            _add_log(db, deployment_id, "Workspace not found", "error")
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+
+        env = _aws_env(user)
+        plan_file = workspace / "deploy.tfplan"
+
+        if plan_file.exists():
+            _add_log(db, deployment_id, "Running terraform apply (saved plan)...")
+            rc = _run_tf(str(workspace), ["apply", "-no-color", "-input=false", str(plan_file)], env, db, deployment_id)
+        else:
+            _add_log(db, deployment_id, "Plan file missing — running apply -auto-approve...", "warning")
+            rc = _run_tf(str(workspace), ["apply", "-auto-approve", "-no-color", "-input=false"], env, db, deployment_id)
+
+        if rc != 0:
+            _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+            return
+
+        from app.config import settings as _settings
+        if not _settings.TF_STATE_BUCKET:
+            state_file = workspace / "terraform.tfstate"
+            if state_file.exists():
+                deployment.terraform_state = state_file.read_text(encoding="utf-8")
+
+        try:
+            workflow_state_dict = None
+            if deployment.workflow_id:
+                from app.models.workflow import Workflow
+                wf = db.query(Workflow).filter(Workflow.id == deployment.workflow_id).first()
+                if wf:
+                    workflow_state_dict = wf.workflow_state
+            resource_count = len(WorkflowState(**workflow_state_dict).nodes) if workflow_state_dict else 0
+        except Exception:
+            resource_count = 0
+
+        _set_status(db, deployment, "succeeded",
+                    completed_at=datetime.now(timezone.utc),
+                    resource_count=resource_count)
+        _add_log(db, deployment_id, f"✓ Deployment complete — {resource_count} resource(s) created", "success")
+
+    except Exception as e:
+        logger.exception("Apply %d crashed", deployment_id)
         try:
             dep = db.query(Deployment).filter(Deployment.id == deployment_id).first()
             if dep:
@@ -250,16 +472,22 @@ def run_destroy(deployment_id: int, user_id: int) -> None:
             _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
             return
 
-        # Restore tfstate if not on disk
+        from app.config import settings as _settings
         state_file = workspace / "terraform.tfstate"
-        if not state_file.exists() and deployment.terraform_state:
-            state_file.write_text(deployment.terraform_state, encoding="utf-8")
-            _add_log(db, deployment_id, "Restored terraform state from database")
 
-        if not state_file.exists():
-            _add_log(db, deployment_id, "No terraform state found — nothing to destroy", "warning")
-            _set_status(db, deployment, "destroyed", completed_at=datetime.now(timezone.utc))
-            return
+        if _settings.TF_STATE_BUCKET:
+            # State lives in S3 — no local restore needed; re-init to connect backend
+            sk = _state_key(user_id, deployment_id)
+        else:
+            if not state_file.exists() and deployment.terraform_state:
+                state_file.write_text(deployment.terraform_state, encoding="utf-8")
+                _add_log(db, deployment_id, "Restored terraform state from database")
+
+            if not state_file.exists():
+                _add_log(db, deployment_id, "No terraform state found — nothing to destroy", "warning")
+                _set_status(db, deployment, "destroyed", completed_at=datetime.now(timezone.utc))
+                return
+            sk = ""
 
         has_access_key = user.auth_method == "access_key" and user.aws_access_key and user.aws_secret_key
         has_assume_role = user.auth_method == "assume_role" and user.role_arn
@@ -269,6 +497,13 @@ def run_destroy(deployment_id: int, user_id: int) -> None:
             return
 
         env = _aws_env(user)
+
+        if _settings.TF_STATE_BUCKET and not (workspace / ".terraform").exists():
+            _add_log(db, deployment_id, "Running terraform init (reconnecting to remote state)...")
+            init_args = ["init", "-no-color", "-input=false"] + _backend_init_args(sk)
+            if _run_tf(str(workspace), init_args, env, db, deployment_id) != 0:
+                _set_status(db, deployment, "failed", completed_at=datetime.now(timezone.utc))
+                return
 
         _add_log(db, deployment_id, "Running terraform destroy -auto-approve...")
         rc = _run_tf(str(workspace), ["destroy", "-auto-approve", "-no-color", "-input=false"], env, db, deployment_id)

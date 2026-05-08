@@ -18,6 +18,10 @@ class User(Base):
     role_arn = Column(String, nullable=True)           # used for assume_role auth
     external_id = Column(Text, nullable=True)          # Encrypted — used for assume_role auth
     anthropic_api_key = Column(Text, nullable=True)   # Encrypted — user-provided Anthropic key
+    # Per-user salt (hex-encoded 32 bytes) used to derive the Fernet encryption key.
+    # NULL means the row was created before per-user salts were introduced; those rows
+    # still decrypt correctly via the legacy static salt.
+    credential_salt = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

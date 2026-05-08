@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     BACKEND_AWS_ACCESS_KEY: str = ""
     BACKEND_AWS_SECRET_KEY: str = ""
     BACKEND_AWS_REGION: str = "us-east-1"
+
+    CLOUDKRAFT_IAM_ARN: str = "arn:aws:iam::REPLACE_WITH_YOUR_ACCOUNT_ID:user/cloudkraft"
+
+    COOKIE_SECURE: bool = False
+
+    # Terraform remote state (S3 + DynamoDB).
+    # Leave blank to use local state (dev / demo mode).
+    TF_STATE_BUCKET: str = ""
+    TF_STATE_LOCK_TABLE: str = ""
+    TF_STATE_REGION: str = "us-east-1"
     
     @field_validator('CORS_ORIGINS', mode='before')
     @classmethod

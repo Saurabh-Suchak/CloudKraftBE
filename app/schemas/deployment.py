@@ -24,6 +24,7 @@ class DeploymentResponse(BaseModel):
     status: str
     workflow_name: Optional[str]
     resource_count: Optional[int]
+    plan_output: Optional[str] = None   # F-012: plan summary, present when status == "planned"
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]

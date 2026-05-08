@@ -11,9 +11,10 @@ class Deployment(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     workflow_id = Column(Integer, ForeignKey("workflows.id"), nullable=True)
     workflow_name = Column(String, nullable=True)
-    status = Column(String, default="pending")  # pending|running|succeeded|failed|destroying|destroyed
+    status = Column(String, default="pending")  # pending|planning|planned|running|succeeded|failed|destroying|destroyed
     workspace_path = Column(String, nullable=True)
     terraform_state = Column(Text, nullable=True)
+    plan_output = Column(Text, nullable=True)    # F-012: stored plan summary shown before apply
     resource_count = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)

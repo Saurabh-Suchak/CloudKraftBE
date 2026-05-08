@@ -1,15 +1,20 @@
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import inspect, text
 from app.config import settings
 from app.database import engine, Base
 from app import models
 from app.api import auth, workflows, codegen, validation, ai, deploy
+from app.limiter import limiter
 from app.services.terraform_runner import prewarm_plugin_cache
+from app.services.workspace_cleanup import cleanup_stale_workspaces
 
-# Create database tables
 Base.metadata.create_all(bind=engine)
 
 
@@ -19,41 +24,63 @@ def _run_column_migrations() -> None:
     with engine.connect() as conn:
         user_cols = {c["name"] for c in inspector.get_columns("users")}
         new_user_cols = [
-            ("auth_method",        "VARCHAR"),
-            ("role_arn",           "VARCHAR"),
-            ("external_id",        "TEXT"),
-            ("anthropic_api_key",  "TEXT"),
+            ("auth_method",       "VARCHAR"),
+            ("role_arn",          "VARCHAR"),
+            ("external_id",       "TEXT"),
+            ("anthropic_api_key", "TEXT"),
+            ("credential_salt",   "VARCHAR"),
         ]
         for col, col_type in new_user_cols:
             if col not in user_cols:
                 conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {col_type}"))
+        deploy_cols = {c["name"] for c in inspector.get_columns("deployments")}
+        if "plan_output" not in deploy_cols:
+            conn.execute(text("ALTER TABLE deployments ADD COLUMN plan_output TEXT"))
         conn.commit()
 
 
 _run_column_migrations()
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Kill any provider plugin processes left over from a previous server run
     import subprocess as _sp
     try:
         _sp.run(["pkill", "-9", "-f", "terraform-provider-aws"], capture_output=True)
     except Exception:
         pass
-    # Kick off terraform provider download in background so first validation is fast
     prewarm_plugin_cache()
+    cleanup_stale_workspaces()
     yield
 
+
+_disable_docs = os.getenv("DISABLE_DOCS", "false").lower() in ("1", "true", "yes")
 
 app = FastAPI(
     title="CloudKraft API",
     description="Backend API for CloudKraft - Visual workflow designer for AWS infrastructure",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None if _disable_docs else "/docs",
+    redoc_url=None if _disable_docs else "/redoc",
+    openapi_url=None if _disable_docs else "/openapi.json",
 )
 
-# Configure CORS
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -62,7 +89,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
 app.include_router(auth.router)
 app.include_router(workflows.router)
 app.include_router(codegen.router)
@@ -73,16 +99,9 @@ app.include_router(deploy.router)
 
 @app.get("/")
 def root():
-    """Root endpoint"""
-    return {
-        "message": "CloudKraft API",
-        "version": "1.0.0",
-        "docs": "/docs"
-    }
+    return {"message": "CloudKraft API", "version": "1.0.0", "docs": "/docs"}
 
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
     return {"status": "healthy"}
-
