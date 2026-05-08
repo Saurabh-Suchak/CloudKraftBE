@@ -119,6 +119,7 @@ RESOURCE_MAPPING: Dict[str, str] = {
     "internetgateway":"aws_internet_gateway",
     "routetable":     "aws_route_table",
     "natgateway":     "aws_nat_gateway",
+    "eip":            "aws_eip",
     "loadbalancer":   "aws_lb",
     "s3":             "aws_s3_bucket",
     "efs":            "aws_efs_file_system",
@@ -139,7 +140,7 @@ RESOURCE_DEPENDENCIES: Dict[str, List[str]] = {
     "securitygroup":  ["vpc"],
     "internetgateway":["vpc"],
     "routetable":     ["vpc"],
-    "natgateway":     ["subnet"],
+    "natgateway":     ["subnet", "eip"],
     "ec2":            ["subnet", "securitygroup"],
     "loadbalancer":   ["subnet", "securitygroup"],
     "rds":            ["subnet", "securitygroup"],
@@ -335,7 +336,7 @@ _SKIP_ATTRS = frozenset({"id", "tags_all", "arn"})
 _SUBNET_DEPENDENT_TYPES = frozenset({"ec2", "rds", "loadbalancer", "efs", "ebs"})
 
 # Synthetic node IDs injected when no VPC/subnet exists in the workflow
-_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__"})
+_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__", "__scaffold_eip__"})
 
 
 class TerraformGenerator:
@@ -475,6 +476,15 @@ class TerraformGenerator:
                 '}\n'
             )
 
+        # Scaffold EIP block (auto-generated when NAT Gateway exists but no EIP on canvas)
+        if "__scaffold_eip__" in self.nodes:
+            blocks.append(
+                'resource "aws_eip" "nat_eip" {\n'
+                '  domain = "vpc"\n'
+                '  tags   = { Name = "nat-eip" }\n'
+                '}\n'
+            )
+
         for node_id in dependency_order:
             if node_id in _SCAFFOLD_IDS:
                 continue  # already emitted above
@@ -529,34 +539,52 @@ class TerraformGenerator:
 
     def _inject_scaffold_nodes(self) -> None:
         """
-        When compute resources need a subnet but none exists in the workflow,
-        inject synthetic VPC + Subnet nodes so reference resolution produces
-        valid HCL instead of missing ``subnet_id``.
+        Inject synthetic nodes so reference resolution produces valid HCL
+        when expected resources are absent from the workflow.
         """
+        # VPC + Subnet scaffold: needed when compute nodes exist but no subnet
         has_subnet = any(n.type == "subnet" for n in self.nodes.values())
         needs_subnet = any(n.type in _SUBNET_DEPENDENT_TYPES for n in self.nodes.values())
 
-        if not needs_subnet or has_subnet:
-            return
+        if needs_subnet and not has_subnet:
+            has_vpc = any(n.type == "vpc" for n in self.nodes.values())
 
-        has_vpc = any(n.type == "vpc" for n in self.nodes.values())
+            if not has_vpc:
+                self.nodes["__scaffold_vpc__"] = WorkflowNode(
+                    id="__scaffold_vpc__",
+                    type="vpc",
+                    position={"x": 0, "y": 0},
+                    config={"nodeName": "cloudkraft_vpc"},
+                    connections=[],
+                )
 
-        if not has_vpc:
-            self.nodes["__scaffold_vpc__"] = WorkflowNode(
-                id="__scaffold_vpc__",
-                type="vpc",
+            self.nodes["__scaffold_subnet__"] = WorkflowNode(
+                id="__scaffold_subnet__",
+                type="subnet",
                 position={"x": 0, "y": 0},
-                config={"nodeName": "cloudkraft_vpc"},
+                config={"nodeName": "cloudkraft_subnet"},
                 connections=[],
             )
 
-        self.nodes["__scaffold_subnet__"] = WorkflowNode(
-            id="__scaffold_subnet__",
-            type="subnet",
-            position={"x": 0, "y": 0},
-            config={"nodeName": "cloudkraft_subnet"},
-            connections=[],
+        # EIP scaffold: public NAT Gateways require allocation_id (Elastic IP).
+        # Inject a synthetic EIP so the reference resolves without user placing one on canvas.
+        # Skip if user manually provided allocation_id in the NAT gateway config.
+        has_natgateway = any(n.type == "natgateway" for n in self.nodes.values())
+        has_eip = any(n.type == "eip" for n in self.nodes.values())
+        has_manual_allocation = any(
+            n.type == "natgateway" and (
+                (n.config or {}).get("allocation_id") or (n.config or {}).get("nodeAllocationId")
+            )
+            for n in self.nodes.values()
         )
+        if has_natgateway and not has_eip and not has_manual_allocation:
+            self.nodes["__scaffold_eip__"] = WorkflowNode(
+                id="__scaffold_eip__",
+                type="eip",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "nat_eip", "domain": "vpc"},
+                connections=[],
+            )
 
     # ------------------------------------------------------------------
     # Dependency ordering (topological sort)
