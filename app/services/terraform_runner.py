@@ -57,8 +57,9 @@ provider "aws" {
 }
 """
 
-# Resolved once at import time
-_TERRAFORM_BIN: Optional[str] = shutil.which("terraform")
+# Resolved once at import time — check PATH first, then project-local bin/ (Render)
+_LOCAL_TF = Path(__file__).parent.parent.parent / "bin" / "terraform"
+_TERRAFORM_BIN: Optional[str] = shutil.which("terraform") or (str(_LOCAL_TF) if _LOCAL_TF.exists() else None)
 
 # Lock so only one prewarm runs at a time
 _prewarm_lock = threading.Lock()
