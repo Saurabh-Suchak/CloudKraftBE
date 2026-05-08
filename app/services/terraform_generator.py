@@ -125,6 +125,7 @@ RESOURCE_MAPPING: Dict[str, str] = {
     "efs":            "aws_efs_file_system",
     "ebs":            "aws_ebs_volume",
     "rds":            "aws_db_instance",
+    "dbsubnetgroup":  "aws_db_subnet_group",
     "dynamodb":       "aws_dynamodb_table",
     "sns":            "aws_sns_topic",
     "sqs":            "aws_sqs_queue",
@@ -143,7 +144,7 @@ RESOURCE_DEPENDENCIES: Dict[str, List[str]] = {
     "natgateway":     ["subnet", "eip"],
     "ec2":            ["subnet", "securitygroup"],
     "loadbalancer":   ["subnet", "securitygroup"],
-    "rds":            ["subnet", "securitygroup"],
+    "rds":            ["subnet", "securitygroup", "dbsubnetgroup"],
     "efs":            ["subnet", "securitygroup"],
     "ebs":            ["subnet"],
 }
@@ -167,7 +168,7 @@ REFERENCE_ATTRIBUTE_MAP: Dict[str, Tuple[str, str, bool]] = {
     "subnet_ids":                ("subnet",          "id",   True),
     "subnets":                   ("subnet",          "id",   True),
     "vpc_zone_identifier":       ("subnet",          "id",   True),
-    "db_subnet_group_name":      ("subnet",          "id",   False),
+    "db_subnet_group_name":      ("dbsubnetgroup",   "name", False),
     "security_group_ids":        ("securitygroup",   "id",   True),
     "vpc_security_group_ids":    ("securitygroup",   "id",   True),
     "role":                      ("iamrole",         "arn",  False),
@@ -323,7 +324,13 @@ _SKIP_ATTRS = frozenset({"id", "tags_all", "arn"})
 _SUBNET_DEPENDENT_TYPES = frozenset({"ec2", "rds", "loadbalancer", "efs", "ebs"})
 
 # Synthetic node IDs injected when no VPC/subnet exists in the workflow
-_SCAFFOLD_IDS = frozenset({"__scaffold_vpc__", "__scaffold_subnet__", "__scaffold_eip__"})
+_SCAFFOLD_IDS = frozenset({
+    "__scaffold_vpc__",
+    "__scaffold_subnet__",
+    "__scaffold_subnet_2__",
+    "__scaffold_eip__",
+    "__scaffold_db_subnet_group__",
+})
 
 
 class TerraformGenerator:
@@ -472,6 +479,41 @@ class TerraformGenerator:
                 '}\n'
             )
 
+        # Scaffold second subnet (auto-generated when ALB exists with only 1 subnet)
+        if "__scaffold_subnet_2__" in self.nodes:
+            vpc_ref = (
+                self._find_resource_reference("vpc", self.nodes["__scaffold_subnet_2__"], "id")
+                or "aws_vpc.cloudkraft_vpc.id"
+            )
+            blocks.append(
+                'resource "aws_subnet" "cloudkraft_subnet_2" {\n'
+                f'  vpc_id                  = {vpc_ref}\n'
+                '  cidr_block              = "10.0.2.0/24"\n'
+                '  availability_zone       = "us-east-1b"\n'
+                '  map_public_ip_on_launch = true\n'
+                '  tags = { Name = "cloudkraft-subnet-2" }\n'
+                '}\n'
+            )
+
+        # Scaffold DB Subnet Group (auto-generated when RDS exists without one on canvas)
+        if "__scaffold_db_subnet_group__" in self.nodes:
+            # Collect all subnet references in the workflow
+            subnet_refs = [
+                self._ref_expr(n, "id")
+                for n in self.nodes.values()
+                if n.type == "subnet"
+            ]
+            if not subnet_refs:
+                subnet_refs = ["aws_subnet.cloudkraft_subnet.id"]
+            subnet_ids_hcl = ", ".join(subnet_refs)
+            blocks.append(
+                'resource "aws_db_subnet_group" "rds_subnet_group" {\n'
+                '  name       = "rds-subnet-group"\n'
+                f'  subnet_ids = [{subnet_ids_hcl}]\n'
+                '  tags       = { Name = "rds-subnet-group" }\n'
+                '}\n'
+            )
+
         for node_id in dependency_order:
             if node_id in _SCAFFOLD_IDS:
                 continue  # already emitted above
@@ -570,6 +612,30 @@ class TerraformGenerator:
                 type="eip",
                 position={"x": 0, "y": 0},
                 config={"nodeName": "nat_eip", "domain": "vpc"},
+                connections=[],
+            )
+
+        # Second subnet scaffold: ALB requires ≥2 subnets in different AZs.
+        has_lb = any(n.type == "loadbalancer" for n in self.nodes.values())
+        subnet_count = sum(1 for n in self.nodes.values() if n.type == "subnet")
+        if has_lb and subnet_count == 1:
+            self.nodes["__scaffold_subnet_2__"] = WorkflowNode(
+                id="__scaffold_subnet_2__",
+                type="subnet",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "cloudkraft_subnet_2", "nodeAz": "us-east-1b"},
+                connections=[],
+            )
+
+        # DB Subnet Group scaffold: RDS requires aws_db_subnet_group, not a raw subnet ID.
+        has_rds = any(n.type == "rds" for n in self.nodes.values())
+        has_db_subnet_group = any(n.type == "dbsubnetgroup" for n in self.nodes.values())
+        if has_rds and not has_db_subnet_group:
+            self.nodes["__scaffold_db_subnet_group__"] = WorkflowNode(
+                id="__scaffold_db_subnet_group__",
+                type="dbsubnetgroup",
+                position={"x": 0, "y": 0},
+                config={"nodeName": "rds_subnet_group"},
                 connections=[],
             )
 
@@ -676,6 +742,12 @@ class TerraformGenerator:
 
             # 1. Reference attribute
             if attr_name in REFERENCE_ATTRIBUTE_MAP:
+                # subnets / vpc_zone_identifier for ALB/ASG: collect ALL subnet refs
+                if attr_name in ("subnets", "vpc_zone_identifier", "subnet_ids"):
+                    all_refs = self._find_all_resource_references("subnet", node, "id")
+                    if all_refs:
+                        lines.append(f'{attr_name} = [{", ".join(all_refs)}]')
+                        continue
                 ref_line = self._resolve_reference_attr(attr_name, node)
                 if ref_line:
                     lines.append(ref_line)
@@ -893,6 +965,28 @@ class TerraformGenerator:
                 return self._ref_expr(other, attr)
 
         return None
+
+    def _find_all_resource_references(
+        self, resource_type: str, node: WorkflowNode, attr: str = "id"
+    ) -> List[str]:
+        """Return HCL reference expressions for ALL nodes of *resource_type* in the workflow."""
+        seen: set = set()
+        refs: List[str] = []
+
+        # Direct connections first
+        for conn_id in node.connections:
+            connected = self.nodes.get(conn_id)
+            if connected and connected.type == resource_type and conn_id not in seen:
+                refs.append(self._ref_expr(connected, attr))
+                seen.add(conn_id)
+
+        # All other nodes of that type
+        for other_id, other in self.nodes.items():
+            if other.type == resource_type and other_id != node.id and other_id not in seen:
+                refs.append(self._ref_expr(other, attr))
+                seen.add(other_id)
+
+        return refs
 
     def _ref_expr(self, node: WorkflowNode, attr: str) -> str:
         """Build a HCL reference expression, e.g. ``aws_vpc.main_vpc.id``."""
