@@ -300,21 +300,8 @@ RESOURCE_DEFAULTS: Dict[str, Dict[str, str]] = {
 # Keys: terraform_type → block_name → list of inner HCL lines.
 # ---------------------------------------------------------------------------
 BLOCK_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
-    "aws_security_group": {
-        "ingress": [
-            'description = "Allow SSH from trusted IPs only"',
-            "from_port   = 22",
-            "to_port     = 22",
-            'protocol    = "tcp"',
-            'cidr_blocks = ["YOUR_IP/32"]  # restrict to known CIDRs',
-        ],
-        "egress": [
-            "from_port   = 0",
-            "to_port     = 0",
-            'protocol    = "-1"',
-            'cidr_blocks = ["0.0.0.0/0"]',
-        ],
-    },
+    # aws_security_group ingress/egress handled dynamically in _generate_nested_blocks
+    # so CIDR can be taken from user config or defaulted to 0.0.0.0/0
     "aws_cloudfront_distribution": {
         "restrictions": [
             "geo_restriction {",
@@ -762,6 +749,54 @@ class TerraformGenerator:
                 "}",
             ]
 
+        if terraform_type == "aws_security_group":
+            import ipaddress
+            # Resolve ingress CIDR: user config → validate → fallback 0.0.0.0/0
+            raw_cidr = (
+                config.get("nodeIngressCidr")
+                or config.get("nodeCidr")
+                or config.get("cidr_blocks")
+                or config.get("ingressCidr")
+            )
+            if raw_cidr:
+                try:
+                    ipaddress.ip_network(str(raw_cidr), strict=False)
+                    ingress_cidr = str(raw_cidr)
+                except ValueError:
+                    ingress_cidr = "0.0.0.0/0"
+            else:
+                ingress_cidr = "0.0.0.0/0"
+
+            lines += [
+                "ingress {",
+                '  description = "HTTP"',
+                "  from_port   = 80",
+                "  to_port     = 80",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "ingress {",
+                '  description = "HTTPS"',
+                "  from_port   = 443",
+                "  to_port     = 443",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "ingress {",
+                '  description = "SSH"',
+                "  from_port   = 22",
+                "  to_port     = 22",
+                '  protocol    = "tcp"',
+                f'  cidr_blocks = ["{ingress_cidr}"]',
+                "}",
+                "egress {",
+                "  from_port   = 0",
+                "  to_port     = 0",
+                '  protocol    = "-1"',
+                '  cidr_blocks = ["0.0.0.0/0"]',
+                "}",
+            ]
+
         if terraform_type == "aws_cloudfront_distribution":
             # Prefer connected S3 bucket's regional domain, fallback to config/placeholder
             s3_domain_ref = self._find_resource_reference("s3", node, "bucket_regional_domain_name")
@@ -796,11 +831,13 @@ class TerraformGenerator:
 
         # Schema-required blocks that have no template yet
         already_emitted = set(templates.keys()) | {
-            "attribute",       # dynamodb handled above
-            "origin",          # cloudfront handled above
-            "default_cache_behavior",  # cloudfront template
-            "restrictions",            # cloudfront template
-            "viewer_certificate",      # cloudfront template
+            "attribute",              # dynamodb handled above
+            "ingress",                # security_group handled above
+            "egress",                 # security_group handled above
+            "origin",                 # cloudfront handled above
+            "default_cache_behavior", # cloudfront handled above
+            "restrictions",           # cloudfront template
+            "viewer_certificate",     # cloudfront template
         }
         for block_name, block_def in block_type_defs.items():
             if block_name in already_emitted:
