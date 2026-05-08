@@ -783,6 +783,14 @@ class TerraformGenerator:
         for block_line in self._generate_nested_blocks(terraform_type, config, node):
             lines.append(f"  {block_line}")
 
+        # Security groups: always create-before-destroy to avoid duplicate-rule errors on update
+        if terraform_type == "aws_security_group":
+            lines += [
+                "  lifecycle {",
+                "    create_before_destroy = true",
+                "  }",
+            ]
+
         lines.append("}")
         return "\n".join(lines)
 
@@ -896,18 +904,6 @@ class TerraformGenerator:
             lines.append("}")
 
         # Resource-specific dynamic blocks not covered by templates
-        if terraform_type == "aws_security_group":
-            ingress_cidr = (config or {}).get("nodeIngressCidr") or "0.0.0.0/0"
-            lines += [
-                "ingress {",
-                '  description = "Allow SSH"',
-                "  from_port   = 22",
-                "  to_port     = 22",
-                '  protocol    = "tcp"',
-                f'  cidr_blocks = ["{ingress_cidr}"]',
-                "}",
-            ]
-
         if terraform_type == "aws_dynamodb_table":
             hash_key = self._get_config_value("hash_key", config) or "id"
             lines += [
