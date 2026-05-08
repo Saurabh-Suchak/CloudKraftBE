@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from app.api.auth import get_current_user
 from app.models.user import User
+from app.utils.security import decrypt_aws_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +104,19 @@ async def generate_architecture(
     current_user: User = Depends(get_current_user),
 ):
     """Generate a WorkflowState from a natural language architecture description."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    # Prefer user's own key; fall back to server-level env var
+    api_key: str | None = None
+    if current_user.anthropic_api_key:
+        try:
+            api_key = decrypt_aws_credentials(current_user.anthropic_api_key)
+        except Exception:
+            pass
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=503,
-            detail="AI generation is not configured. Set the ANTHROPIC_API_KEY environment variable.",
+            detail="AI generation is not configured. Add your Anthropic API key in Profile → Environment Variables.",
         )
 
     if not request.prompt.strip():

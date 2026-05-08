@@ -5,7 +5,11 @@ from datetime import timedelta
 import uuid
 from app.database import get_db
 from app.models.user import User
-from app.schemas.user import UserCreate, UserResponse, Token, UserAWSRegister, ConnectAWSRequest, AWSStatusResponse
+from app.schemas.user import (
+    UserCreate, UserResponse, Token, UserAWSRegister, ConnectAWSRequest,
+    AWSStatusResponse, UpdateProfileRequest, ChangePasswordRequest,
+    EnvVarsRequest, EnvVarsResponse,
+)
 from app.utils.security import (
     verify_password,
     get_password_hash,
@@ -211,6 +215,95 @@ def connect_aws(
         role_arn=current_user.role_arn,
         external_id=ext_id_plain,
     )
+
+
+@router.put("/profile", response_model=UserResponse)
+def update_profile(
+    request: UpdateProfileRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update the current user's name and/or email."""
+    if request.email and request.email != current_user.email:
+        existing = db.query(User).filter(User.email == request.email).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        current_user.email = request.email
+    if request.full_name is not None:
+        current_user.full_name = request.full_name
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@router.put("/password")
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change the current user's password."""
+    if not verify_password(request.current_password, current_user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+    current_user.password_hash = get_password_hash(request.new_password)
+    db.commit()
+    return {"message": "Password updated successfully"}
+
+
+@router.get("/env-vars", response_model=EnvVarsResponse)
+def get_env_vars(current_user: User = Depends(get_current_user)):
+    """Return which user-level env vars are configured (masked)."""
+    key_set = bool(current_user.anthropic_api_key)
+    preview = None
+    if key_set:
+        try:
+            decrypted = decrypt_aws_credentials(current_user.anthropic_api_key)
+            preview = "sk-ant-****" + decrypted[-4:] if len(decrypted) > 4 else "****"
+        except Exception:
+            preview = "****"
+    return EnvVarsResponse(anthropic_api_key_set=key_set, anthropic_api_key_preview=preview)
+
+
+@router.put("/env-vars", response_model=EnvVarsResponse)
+def update_env_vars(
+    request: EnvVarsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Set or clear the user's Anthropic API key."""
+    if request.anthropic_api_key == "" or request.anthropic_api_key is None:
+        current_user.anthropic_api_key = None
+    else:
+        current_user.anthropic_api_key = encrypt_aws_credentials(request.anthropic_api_key)
+    db.commit()
+    db.refresh(current_user)
+
+    key_set = bool(current_user.anthropic_api_key)
+    preview = None
+    if key_set:
+        try:
+            decrypted = decrypt_aws_credentials(current_user.anthropic_api_key)
+            preview = "sk-ant-****" + decrypted[-4:] if len(decrypted) > 4 else "****"
+        except Exception:
+            preview = "****"
+    return EnvVarsResponse(anthropic_api_key_set=key_set, anthropic_api_key_preview=preview)
+
+
+@router.post("/disconnect-aws")
+def disconnect_aws(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove all AWS credentials for the current user."""
+    current_user.auth_method = None
+    current_user.aws_access_key = None
+    current_user.aws_secret_key = None
+    current_user.aws_region = None
+    current_user.role_arn = None
+    db.commit()
+    return {"message": "AWS account disconnected"}
 
 
 @router.get("/aws-status", response_model=AWSStatusResponse)

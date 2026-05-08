@@ -145,6 +145,32 @@ def get_deployment_logs(
     )
 
 
+@router.post("/destroy-all", status_code=status.HTTP_202_ACCEPTED)
+async def destroy_all_deployments(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Destroy all active (succeeded/failed) deployments for the current user."""
+    active = (
+        db.query(Deployment)
+        .filter(
+            Deployment.user_id == current_user.id,
+            Deployment.status.in_(["succeeded", "failed"]),
+        )
+        .all()
+    )
+    if not active:
+        return {"message": "No active deployments to destroy", "count": 0}
+
+    loop = asyncio.get_event_loop()
+    for deployment in active:
+        deployment.status = "destroying"
+        db.commit()
+        loop.run_in_executor(None, run_destroy, deployment.id, current_user.id)
+
+    return {"message": f"Destroying {len(active)} deployment(s)", "count": len(active)}
+
+
 @router.post("/{deployment_id}/destroy", response_model=DeploymentResponse, status_code=status.HTTP_202_ACCEPTED)
 async def destroy_deployment(
     deployment_id: int,

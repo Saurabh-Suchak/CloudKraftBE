@@ -19,9 +19,10 @@ def _run_column_migrations() -> None:
     with engine.connect() as conn:
         user_cols = {c["name"] for c in inspector.get_columns("users")}
         new_user_cols = [
-            ("auth_method", "VARCHAR"),
-            ("role_arn",    "VARCHAR"),
-            ("external_id", "TEXT"),
+            ("auth_method",        "VARCHAR"),
+            ("role_arn",           "VARCHAR"),
+            ("external_id",        "TEXT"),
+            ("anthropic_api_key",  "TEXT"),
         ]
         for col, col_type in new_user_cols:
             if col not in user_cols:

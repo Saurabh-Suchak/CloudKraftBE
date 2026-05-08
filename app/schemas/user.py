@@ -52,6 +52,25 @@ class UserResponse(UserBase):
         from_attributes = True
 
 
+class UpdateProfileRequest(BaseModel):
+    full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class EnvVarsRequest(BaseModel):
+    anthropic_api_key: Optional[str] = None
+
+
+class EnvVarsResponse(BaseModel):
+    anthropic_api_key_set: bool
+    anthropic_api_key_preview: Optional[str] = None  # last 4 chars masked
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str
