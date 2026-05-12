@@ -54,6 +54,39 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _recover_orphaned_deployments() -> None:
+    """Mark any in-progress deployments as failed on startup.
+
+    If the server crashes mid-deployment the Terraform subprocess is killed
+    but the DB row stays in 'running'/'destroying'/'pending'/'planning'.
+    The FE would then poll the logs endpoint forever since the status never
+    transitions to a terminal state.  Reset those rows here so the client
+    receives a terminal status on its next poll.
+    """
+    from app.database import SessionLocal
+    from app.models.deployment import Deployment, DeploymentLog
+    from datetime import datetime, timezone
+
+    STUCK = {"pending", "planning", "planned", "running", "destroying"}
+    db = SessionLocal()
+    try:
+        orphans = db.query(Deployment).filter(Deployment.status.in_(STUCK)).all()
+        for dep in orphans:
+            dep.status = "failed"
+            dep.completed_at = datetime.now(timezone.utc)
+            db.add(DeploymentLog(
+                deployment_id=dep.id,
+                level="error",
+                message="Deployment interrupted: server restarted while operation was in progress.",
+            ))
+        if orphans:
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import subprocess as _sp
@@ -61,6 +94,7 @@ async def lifespan(app: FastAPI):
         _sp.run(["pkill", "-9", "-f", "terraform-provider-aws"], capture_output=True)
     except Exception:
         pass
+    _recover_orphaned_deployments()
     prewarm_plugin_cache()
     cleanup_stale_workspaces()
     yield
