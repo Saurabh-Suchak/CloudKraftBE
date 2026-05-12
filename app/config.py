@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480  # 8 hours
     
     # CORS - Can be string (comma-separated) or list
-    CORS_ORIGINS: Union[str, List[str]] = "http://localhost:5173,http://localhost:3000"
+    CORS_ORIGINS: Union[str, List[str]] = "http://localhost:5173,http://localhost:3000,https://cloud-kraft-fe.vercel.app"
     
     # AWS Credentials Encryption
     ENCRYPTION_KEY: str = "your-encryption-key-change-in-production"
