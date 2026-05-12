@@ -143,6 +143,7 @@ def prewarm_plugin_cache() -> None:
                     "-backend=false",
                     "-no-color",
                     "-input=false",
+                    "-upgrade",   # always fetch latest compatible version so lock file stays current
                 ],
                 cwd=str(WARM_WORKSPACE_DIR),
                 capture_output=True,
@@ -227,13 +228,31 @@ def run_terraform_validate(files: Dict[str, str]) -> Dict[str, Any]:
         # ── Fast path: hard-link provider binary so we can skip terraform init ──
         # Symlinks to the shared plugin cache cause inter-process lock deadlocks.
         # Hard links are instant (no data copy) and each tmpdir gets its own path.
-        if _warm_workspace_ready():
+        if not _warm_workspace_ready():
+            # Prewarm still in progress (server just started or restarted).
+            # The slow path would race with prewarm over the shared plugin cache
+            # and likely fail. Tell the user to retry in a moment.
+            return {
+                "valid": False,
+                "errors": [ValidationError(
+                    type="syntax", severity="error",
+                    message=(
+                        "Validation service is initializing (server just started). "
+                        "Please wait ~60 seconds and try again."
+                    ),
+                    line=0,
+                )],
+                "warnings": [],
+                "method": "terraform",
+                "validator_version": terraform_version(),
+            }
+
+        if True:  # warm workspace ready — fast path
             try:
                 _hardlink_provider_into(tmpdir)
-                # Do NOT copy .terraform.lock.hcl — terraform validate does not
-                # enforce checksums (only terraform init does), so omitting the
-                # lock file avoids "checksum does not match" errors when the
-                # cached binary version drifts from the lock file version.
+                warm_lock = WARM_WORKSPACE_DIR / ".terraform.lock.hcl"
+                if warm_lock.exists():
+                    shutil.copy2(str(warm_lock), str(Path(tmpdir) / ".terraform.lock.hcl"))
 
                 logger.debug("Hard-linked provider into tmpdir — skipping terraform init")
                 # Remove TF_PLUGIN_CACHE_DIR so terraform doesn't touch the shared cache
