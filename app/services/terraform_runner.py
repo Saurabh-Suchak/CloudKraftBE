@@ -84,8 +84,16 @@ def terraform_version() -> Optional[str]:
 
 
 def _warm_workspace_ready() -> bool:
-    """True if the warm workspace has been successfully initialised."""
-    return (WARM_WORKSPACE_DIR / ".terraform").exists()
+    """True if the warm workspace has been successfully initialised.
+
+    Requires both .terraform/ AND .terraform.lock.hcl to be present so
+    a crash mid-prewarm (which leaves a partial .terraform/ directory but
+    no lock file) triggers a re-prewarm rather than using corrupt state.
+    """
+    return (
+        (WARM_WORKSPACE_DIR / ".terraform").exists()
+        and (WARM_WORKSPACE_DIR / ".terraform.lock.hcl").exists()
+    )
 
 
 def _build_tf_env() -> Dict[str, str]:
@@ -222,9 +230,10 @@ def run_terraform_validate(files: Dict[str, str]) -> Dict[str, Any]:
         if _warm_workspace_ready():
             try:
                 _hardlink_provider_into(tmpdir)
-                warm_lock = WARM_WORKSPACE_DIR / ".terraform.lock.hcl"
-                if warm_lock.exists():
-                    shutil.copy2(str(warm_lock), str(Path(tmpdir) / ".terraform.lock.hcl"))
+                # Do NOT copy .terraform.lock.hcl — terraform validate does not
+                # enforce checksums (only terraform init does), so omitting the
+                # lock file avoids "checksum does not match" errors when the
+                # cached binary version drifts from the lock file version.
 
                 logger.debug("Hard-linked provider into tmpdir — skipping terraform init")
                 # Remove TF_PLUGIN_CACHE_DIR so terraform doesn't touch the shared cache
